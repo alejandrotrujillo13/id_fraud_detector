@@ -1,0 +1,27 @@
+# Dataset construction settings (phase 1).
+tenants: [esmio, llevaloya]
+# Tenants for a specific STAGE (.env). A stage not listed here uses `tenants` above.
+tenants_by_stage:
+  dev: [demo]
+bucket: sisteya-media
+registered_since: "2025-01-01"
+
+# Positives (forged ID):
+#   (a) fraud_status = FRAUD with no PAID credit
+#   (b) fraud_status = POSSIBLE FRAUD inside an explicit window, with no PAID credit
+possible_fraud_windows:
+  - tenant: esmio
+    start: "2026-09-13"
+    end: "2026-10-04"
+    reason: "Store 623 fraud ring (docs/fraud-score): 65 confirmed + 16 flagged during the investigation"
+
+# Negatives (genuine ID): no fraud_status and at least one PAID credit.
+# Every negative goes into the manifest with metadata + OCR (to measure rule false positives);
+# only a stratified sample (by month and channel) is downloaded with images (to train the CNN).
+negatives_with_images:
+  esmio: 2500
+  llevaloya: 1500
+  demo: 200
+seed: 42
+
+output_dir: data

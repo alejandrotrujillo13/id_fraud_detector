@@ -1,0 +1,25 @@
+# Datos personales: nunca al repositorio
+data/
+.env
+.venv
+*.png
+*.jpg
+*.jpeg
+*.csv
+!config/*.csv
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+# Modelos
+models/
+runs/
+*.keras
+*.h5
+*.pt
+# Packaging
+*.egg-info/
+build/
+dist/
+*.part
