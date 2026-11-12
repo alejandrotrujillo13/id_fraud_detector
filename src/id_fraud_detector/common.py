@@ -1,8 +1,11 @@
 """Shared helpers: config loading, anonymization and read-only connections.
 
-AWS access always goes through the default credential chain (the SSO session opened with
-`aws sso login`); no access keys are stored in this project. Database credentials come from
-Secrets Manager, the same secret mikro_back uses, and the database name from STAGE in .env.
+AWS access to the database and S3 always goes through the default credential chain (the SSO
+session opened with `aws sso login`); no access keys are stored in this project. Database
+credentials come from Secrets Manager, the same secret mikro_back uses, and the database name
+from STAGE in .env. Rekognition is the only service used on another account: a named profile
+(REKOGNITION_PROFILE) whose account number must also be stated (REKOGNITION_ACCOUNT_ID), with no
+default for either, so its cost never reaches the corporate account.
 """
 import functools
 import hashlib
@@ -42,6 +45,12 @@ def output_dir(cfg: dict) -> Path:
     can never end up mixed with the live dataset."""
     out = Path(cfg.get("output_dir", "data"))
     return (out if out.is_absolute() else ROOT / out) / stage()
+
+
+def image_path(out: Path, tenant: str, label: str, anon: str, side: str) -> Path:
+    """Where the photo of one side of a person is kept on disk (under the stage's output folder).
+    Every script uses this path, so a photo already on disk is never downloaded again."""
+    return out / "images" / tenant / label.lower() / f"{anon}_{side}.png"
 
 
 def _salted_hash(*parts: str) -> str:
@@ -151,3 +160,87 @@ def query_df(con, sql: str, params: dict | None = None):
 def s3_client():
     """S3 client on the same SSO session. This project only calls GetObject."""
     return aws_session().client("s3")
+
+
+def paying_account() -> tuple[str, str]:
+    """(profile name, 12-digit account id) of the AWS account that pays for the services with a
+    cost, from REKOGNITION_PROFILE and REKOGNITION_ACCOUNT_ID in .env. Both are required and
+    neither has a default: nothing with a cost runs until the paying account has been named."""
+    profile = (os.environ.get("REKOGNITION_PROFILE") or "").strip()
+    account = (os.environ.get("REKOGNITION_ACCOUNT_ID") or "").strip().replace("-", "")
+    missing = [name for name, value in (("REKOGNITION_PROFILE", profile), ("REKOGNITION_ACCOUNT_ID", account))
+               if not value]
+    if missing:
+        raise RuntimeError(f"{' and '.join(missing)} missing in .env. Services with a cost only run on the account "
+                           "you name: REKOGNITION_PROFILE is the name of its AWS profile (create it with "
+                           "`aws configure --profile <name>`) and REKOGNITION_ACCOUNT_ID its 12-digit account "
+                           "number. There is no default.")
+    if not re.fullmatch(r"\d{12}", account):
+        raise RuntimeError("REKOGNITION_ACCOUNT_ID must be the 12-digit number of the AWS account that pays")
+    return profile, account
+
+
+def rekognition_session():
+    """boto3 session of the account that pays for Rekognition: the named profile in
+    REKOGNITION_PROFILE (.env). Never the default credential chain, which is the corporate SSO
+    session used for the database and S3. The keys of that profile live in ~/.aws/credentials
+    (`aws configure --profile <name>`), outside this repository. With an explicit profile boto3
+    also ignores the AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY environment variables."""
+    import boto3
+    from botocore.exceptions import ProfileNotFound
+
+    profile, _ = paying_account()
+    try:
+        return boto3.Session(profile_name=profile, region_name=os.environ.get("REKOGNITION_REGION") or DEFAULT_REGION)
+    except ProfileNotFound as e:
+        raise RuntimeError(f"AWS profile '{profile}' (REKOGNITION_PROFILE) does not exist. "
+                           f"Create it with `aws configure --profile {profile}`.") from e
+
+
+def account_id(session) -> str:
+    """AWS account a session belongs to (sts:GetCallerIdentity needs no permission)."""
+    return session.client("sts").get_caller_identity()["Account"]
+
+
+def rekognition_client():
+    """Rekognition client on the paying account. The only place where a client of a service with
+    a cost is created. It refuses to continue unless the paying account was named in .env
+    (profile and account number), the profile's credentials really belong to that account, and
+    that account is not the one of the default session. So the corporate account is never
+    billed for Rekognition, not even by a wrong or missing setting."""
+    from botocore.config import Config
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    _, expected = paying_account()
+    session = rekognition_session()
+    try:
+        paying = account_id(session)
+    except (BotoCoreError, ClientError) as e:
+        raise RuntimeError(f"The credentials of the profile '{session.profile_name}' (REKOGNITION_PROFILE) "
+                           f"do not work: {type(e).__name__}") from e
+    if paying != expected:
+        raise RuntimeError(f"The profile '{session.profile_name}' (REKOGNITION_PROFILE) belongs to the AWS account "
+                           f"****{paying[-4:]}, not to the one named in REKOGNITION_ACCOUNT_ID (****{expected[-4:]}). "
+                           "Refusing to continue.")
+    try:
+        corporate = account_id(aws_session())
+    except (BotoCoreError, ClientError) as e:
+        raise RuntimeError(f"No valid AWS session ({type(e).__name__}). Run `{_sso_hint()}` and try again.") from e
+    if paying == corporate:
+        raise RuntimeError("REKOGNITION_PROFILE points to the same AWS account as the default session. "
+                           "Rekognition must run on a different account; refusing to continue.")
+    print(f"   rekognition: profile '{session.profile_name}', account ****{paying[-4:]}"
+          f"  (database and S3: account ****{corporate[-4:]})")
+    return session.client("rekognition", config=Config(retries={"max_attempts": 10, "mode": "adaptive"}))
+
+
+def s3_fingerprint(s3, bucket: str, key: str) -> tuple[str, int] | None:
+    """(ETag, size in bytes) of an object, read with a one-byte ranged GetObject: nothing is
+    downloaded. Two objects with the same fingerprint hold the same bytes. None when the object
+    cannot be read; callers must treat None as "not comparable"."""
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-0")
+        response["Body"].close()
+        return response["ETag"], int(response["ContentRange"].rsplit("/", 1)[1])
+    except Exception:
+        return None

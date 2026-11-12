@@ -1,19 +1,27 @@
 """Phase 1 · OCR coverage and first validation of the structural rules.
 
-For every row of the manifest (positives and all negatives) it parses the stored Rekognition
-OCR, runs the rule engine and the cross-customer "repeated back" check, and reports:
+For every row of the manifest (positives and all negatives) it parses the Rekognition OCR,
+runs the rule engine and the cross-customer "repeated back" check, and reports:
 
   1. legibility of each field per tenant and label (coverage of the rules in practice)
   2. per rule: PASS / FAIL / NOT_EVALUABLE counts by label -> false-positive rate on negatives,
      detection rate on positives (same method as mikro_back/docs/fraud-score/01-problema.html)
 
-Usage:  python scripts/12_ocr_coverage.py
-Writes (under data/<stage>/):
+Text source (--ocr):
+  fresh    data/<stage>/ocr_fresh/, written by 14_fresh_ocr.py from the current photos (default).
+           Only the people Rekognition has already read are measured, so it also works on a
+           partial run.
+  stored   data/<stage>/ocr/, the text kept in production (covers a minority of the customers)
+
+Usage:  python scripts/12_ocr_coverage.py [--ocr fresh|stored]
+Writes (under data/<stage>/; with --ocr stored the names end in _stored):
         rules_summary.csv              per rule and label: coverage, FAIL count and rates
         rules_per_customer.csv         per customer: which fields were readable + status of every rule
         private/rules_values.csv       per customer: the values read (ID numbers, serials). LOCAL ONLY
 """
+import argparse
 import json
+import sys
 
 import pandas as pd
 
@@ -51,18 +59,34 @@ def repeated_back_rule(df: pd.DataFrame) -> pd.Series:
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ocr", choices=["fresh", "stored"], default="fresh",
+                    help="fresh = text read again from the current photos (14_fresh_ocr.py); "
+                         "stored = text kept in production")
+    args = ap.parse_args()
+
     cfg = load_config()
     out = output_dir(cfg)
     manifest = pd.read_csv(out / "manifest.csv")
+    ocr_dir = out / ("ocr_fresh" if args.ocr == "fresh" else "ocr")
+    suffix = "" if args.ocr == "fresh" else "_stored"
+    if not ocr_dir.is_dir():
+        sys.exit(f"ERROR: {ocr_dir} does not exist. Run 14_fresh_ocr.py first, or use --ocr stored.")
 
-    rows = []
+    rows, without_file, not_read = [], 0, 0
     for r in manifest.itertuples(index=False):
-        with open(out / "ocr" / f"{r.anon_id}.json", encoding="utf-8") as f:
-            ocr = json.load(f)
+        try:
+            with open(ocr_dir / f"{r.anon_id}.json", encoding="utf-8") as f:
+                ocr = json.load(f)
+        except (FileNotFoundError, ValueError):  # not processed yet: no text, every rule abstains
+            ocr, without_file = {}, without_file + 1
+        if args.ocr == "fresh" and not all((ocr.get(side) or {}).get("ocr_at") for side in ("front", "back")):
+            not_read += 1  # Rekognition has not read both photos: measuring this person would only dilute the rates
+            continue
         back = extract_back_fields(ocr.get("data_back_id"))
         ftext = front_text(ocr.get("data_front_id"))
         row = {
-            "anon_id": r.anon_id, "tenant": r.tenant, "label": r.label,
+            "anon_id": r.anon_id, "tenant": r.tenant, "label": r.label, "channel": r.channel,
             "front_number": parse_front_number(ftext),
             "code_sequence": back.code.sequence if back.code else None,
             "code_number": back.code.number if back.code else None,
@@ -75,8 +99,16 @@ def main():
         for res in evaluate(ftext, back):
             row[res.rule] = res.status
         rows.append(row)
+    if not rows:
+        sys.exit(f"ERROR: nobody in the manifest has been read yet in {ocr_dir}. Run 14_fresh_ocr.py --run first.")
     df = pd.DataFrame(rows)
     df["R_REPEATED_BACK"] = repeated_back_rule(df)
+    if args.ocr == "fresh":
+        print(f"text source: fresh ({ocr_dir})   people measured: {len(df)} of {len(manifest)}"
+              + (f"   (left out, not read by Rekognition yet: {not_read})" if not_read else ""))
+    else:
+        print(f"text source: stored ({ocr_dir})   people: {len(df)}"
+              + (f"   WITHOUT a text file: {without_file}" if without_file else ""))
 
     # 1. field legibility
     fields = {"front_number": "front number", "code_sequence": "back code", "serial_digits": "serial",
@@ -86,15 +118,20 @@ def main():
     # per-customer file only says whether each field was readable and how each rule ended.
     value_cols = ["front_number", "code_sequence", "code_number", "code_production", "serial_digits"]
     (out / "private").mkdir(parents=True, exist_ok=True)
-    df[["anon_id", "tenant", "label"] + value_cols].to_csv(out / "private" / "rules_values.csv", index=False)
+    df[["anon_id", "tenant", "label"] + value_cols].to_csv(out / "private" / f"rules_values{suffix}.csv", index=False)
     public = df.drop(columns=value_cols)
     for col in ("front_number", "code_sequence", "serial_digits"):
         public.insert(3, f"read_{col}", df[col].notna())
-    public.to_csv(out / "rules_per_customer.csv", index=False)
-    cov = df.groupby(["tenant", "label"]).agg(**{v: (k, lambda s: s.notna().mean()) for k, v in fields.items()},
-                                              two_dates=("n_dates", lambda s: (s >= 2).mean()), n=("anon_id", "size"))
+    public.to_csv(out / f"rules_per_customer{suffix}.csv", index=False)
+
+    def legibility(by: list[str]) -> pd.DataFrame:
+        return df.groupby(by, dropna=False).agg(**{v: (k, lambda s: s.notna().mean()) for k, v in fields.items()},
+                                  two_dates=("n_dates", lambda s: (s >= 2).mean()), n=("anon_id", "size"))
+
     print("\n== Field legibility (share of customers with a readable value)")
-    print(cov.round(3).to_string())
+    print(legibility(["tenant", "label"]).round(3).to_string())
+    print("\n== Field legibility by channel (the channel decides the camera, so it can explain a difference)")
+    print(legibility(["label", "channel"]).round(3).to_string())
 
     # 2. rule outcomes by label
     rule_cols = [c for c in df.columns if c.startswith("R_")]
@@ -109,7 +146,7 @@ def main():
                             "fail_rate_of_evaluable": (s == FAIL).sum() / max(1, n_eval),
                             "fail_rate_of_all": (s == FAIL).sum() / max(1, len(s))})
     summary = pd.DataFrame(summary)
-    summary.to_csv(out / "rules_summary.csv", index=False)
+    summary.to_csv(out / f"rules_summary{suffix}.csv", index=False)
     print("\n== Rules by label (fail_rate on NEGATIVE = false positives; on POSITIVE = detection)")
     print(summary.round(4).to_string(index=False))
 

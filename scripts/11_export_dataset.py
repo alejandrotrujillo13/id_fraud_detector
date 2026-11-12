@@ -1,21 +1,34 @@
 """Phase 1 · Dataset construction.
 
 For each tenant it reads (read-only) users_client, credits_credit and
-users_customeridvalidationresult, applies the labeling rules from config.yaml and writes:
+users_customeridvalidationresult, applies the labeling rules from config.yaml, keeps one row
+per person across tenants and writes the files below. Besides fraud_status, a customer is a
+positive when a source of `confirmed_fraud_sources` (config.yaml) matches, or when an analyst
+confirmed the ID as forged in the team's verifier (history saved under
+data/<stage>/private/verifier_history/casos/, if present); always with no PAID credit.
 
-  data/<stage>/manifest.csv              one row per customer (positives and ALL negatives), anonymized
+  data/<stage>/manifest.csv              one row per person (positives and ALL negatives), anonymized
   data/<stage>/ocr/<anon_id>.json        Rekognition text lines (front and back) to measure the rules
+                                 (format and origin of the text: id_fraud_detector/ocr_store.py)
   data/<stage>/images/<tenant>/<label>/<anon_id>_front.png / _back.png
                                  every positive + a stratified sample of negatives
-  data/<stage>/private/id_map.csv        anon_id -> document number (LOCAL ONLY, git-ignored; needed for the backtest)
+  data/<stage>/private/id_map.csv        anon_id -> document number and S3 keys of the photos
+                                 (LOCAL ONLY, git-ignored; needed for the backtest and for 14_fresh_ocr.py)
+
+One row per person: a document number labeled in several tenants is kept once, so the same ID
+card is not repeated in the dataset (rule: id_fraud_detector.dataset.one_row_per_person). The
+photos are the ones of the tenant of the kept row; `labeled_in` lists every tenant.
+
+A customer validated earlier in another brand has copied photos and no text of their own.
+For those, the text stored in the other configured tenant is reused, only when the image of
+that side is identical in both tenants (checked with a one-byte read of each S3 object).
 
 It can be re-run safely: OCR files and images already on disk are not fetched again.
 
-Usage:  python scripts/11_export_dataset.py [--no-images] [--tenant esmio] [--refresh-ocr] [--workers 8]
+Usage:  python scripts/11_export_dataset.py [--no-images] [--refresh-ocr] [--no-borrow-ocr] [--workers 8]
 """
 import argparse
 import hashlib
-import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -26,49 +39,13 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from id_fraud_detector.common import anon_id, load_config, output_dir, person_id, pg_connection, s3_client
-from id_fraud_detector.dataset import (POSITIVE, fetch_clients, fetch_common_fraud_status, fetch_ocr_lines,
-                                       label_clients, sample_negatives, stored_ocr)
-
-SIDES = ("front", "back")
-
-
-def export_ocr(con, df: pd.DataFrame, ocr_dir: Path, refresh: bool) -> None:
-    """Write ocr/<anon_id>.json for every customer in df that does not have one yet."""
-    pending = df if refresh else df[[not (ocr_dir / f"{a}.json").exists() for a in df["anon_id"]]]
-    if pending.empty:
-        print("   OCR: every file already on disk, nothing to fetch")
-        return
-    anon_by_client = dict(zip(pending["client_id"], pending["anon_id"]))
-    written = set()
-    with tqdm(total=len(pending), desc="   OCR") as bar:
-        for row in fetch_ocr_lines(con, pending["client_id"]):
-            payload = stored_ocr(row["front_lines"], row["back_lines"])
-            payload["validation_updated_at"] = str(row["validation_updated_at"])
-            aid = anon_by_client[row["client_id"]]
-            (ocr_dir / f"{aid}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            written.add(row["client_id"])
-            bar.update(1)
-        for client_id, aid in anon_by_client.items():  # customers without a validation row
-            if client_id not in written:
-                payload = stored_ocr(None, None)
-                payload["validation_updated_at"] = None
-                (ocr_dir / f"{aid}.json").write_text(json.dumps(payload), encoding="utf-8")
-                bar.update(1)
-
-
-def ocr_flags(ocr_dir: Path, anon_ids) -> pd.DataFrame:
-    """has_front_ocr / has_back_ocr / validation_updated_at read back from the exported files."""
-    rows = []
-    for aid in anon_ids:
-        data = json.loads((ocr_dir / f"{aid}.json").read_text(encoding="utf-8"))
-        rows.append({
-            "anon_id": aid,
-            "has_front_ocr": bool(data["data_front_id"]["detected_text"]["TextDetections"]),
-            "has_back_ocr": bool(data["data_back_id"]["detected_text"]["TextDetections"]),
-            "validation_updated_at": data.get("validation_updated_at"),
-        })
-    return pd.DataFrame(rows, columns=["anon_id", "has_front_ocr", "has_back_ocr", "validation_updated_at"])
+from id_fraud_detector.common import (anon_id, image_path, load_config, output_dir, person_id, pg_connection,
+                                      s3_client)
+from id_fraud_detector.dataset import (COMMON_COLUMNS, POSITIVE, add_common_info, confirmed_customers,
+                                       fetch_clients, fetch_common_clients, label_clients, one_row_per_person,
+                                       sample_negatives)
+from id_fraud_detector.ocr_store import SIDES, borrow_ocr, export_ocr, ocr_flags
+from id_fraud_detector.verifier import forged_by_analyst
 
 
 def fetch_image(s3, bucket: str, key: str, dest: Path) -> dict:
@@ -96,7 +73,7 @@ def download_images(s3, bucket: str, df: pd.DataFrame, out: Path, workers: int) 
     tasks = []
     for r in df.itertuples(index=False):
         for side in SIDES:
-            dest = out / "images" / r.tenant / r.label.lower() / f"{r.anon_id}_{side}.png"
+            dest = image_path(out, r.tenant, r.label, r.anon_id, side)
             tasks.append((r.anon_id, side, getattr(r, f"{side}_id_image"), dest))
 
     def work(task):
@@ -116,21 +93,17 @@ def download_images(s3, bucket: str, df: pd.DataFrame, out: Path, workers: int) 
     return pd.DataFrame(list(result.values()))
 
 
-def merge_with_existing(path: Path, new: pd.DataFrame, tenants: list[str]) -> pd.DataFrame:
-    """When only some tenants were processed, keep the rows of the other tenants already in the file."""
-    if path.exists():
-        old = pd.read_csv(path, dtype=str)
-        old = old[~old["tenant"].isin(tenants)]
-        if not old.empty:
-            return pd.concat([old, new.astype(object)], ignore_index=True)
-    return new
+def counts(df: pd.DataFrame) -> str:
+    positives = int((df["label"] == POSITIVE).sum())
+    return f"positives={positives}  negatives={len(df) - positives}"
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--no-images", action="store_true", help="manifest + OCR only, no S3 downloads")
-    ap.add_argument("--tenant", help="process a single tenant")
+    ap.add_argument("--no-images", action="store_true", help="manifest + OCR only, no image downloads")
     ap.add_argument("--refresh-ocr", action="store_true", help="fetch the OCR again even if the file exists")
+    ap.add_argument("--no-borrow-ocr", action="store_true",
+                    help="do not reuse the text stored in the other tenant for identical images")
     ap.add_argument("--workers", type=int, default=8, help="parallel S3 downloads")
     args = ap.parse_args()
 
@@ -139,42 +112,74 @@ def main():
     ocr_dir = out / "ocr"
     ocr_dir.mkdir(parents=True, exist_ok=True)
     (out / "private").mkdir(parents=True, exist_ok=True)
-    s3 = None if args.no_images else s3_client()
-    tenants = [t for t in cfg["tenants"] if not args.tenant or t == args.tenant]
-    if not tenants:
-        sys.exit(f"tenant '{args.tenant}' is not in config.yaml")
+    tenants = cfg["tenants"]
+    borrow = not args.no_borrow_ocr and len(tenants) > 1
+    s3 = s3_client() if borrow or not args.no_images else None
 
-    manifests, id_maps, common = [], [], None
+    # 1. label the customers of every tenant
+    forged = forged_by_analyst(out)  # IDs an analyst confirmed as forged in the team's verifier (may be empty)
+    print(f"verifier history: {len(forged)} ID numbers confirmed as forged by an analyst")
+    labeled, common = [], None
     for tenant in tenants:
         print(f"== {tenant}: querying database (read-only)")
         with closing(pg_connection(tenant)) as con:
             if common is None:
                 try:
-                    common = fetch_common_fraud_status(con)
+                    common = fetch_common_clients(con)
                 except Exception as e:
-                    print(f"   WARNING: could not read the cross-brand fraud flag ({str(e).strip()[:100]})")
-                    common = pd.DataFrame(columns=["document_number", "common_fraud_status"])
-            clients = label_clients(fetch_clients(con, cfg["registered_since"]), tenant, cfg)
-            df = clients[clients["label"].notna()].copy()
-            df["tenant"] = tenant
-            df["anon_id"] = [anon_id(tenant, d) for d in df["document_number"]]
-            df["person_id"] = [person_id(d) for d in df["document_number"]]
-            df = df.merge(common, on="document_number", how="left")
-            with_images = set(df.loc[df["label"] == POSITIVE, "client_id"]) | \
-                sample_negatives(df, cfg["negatives_with_images"].get(tenant, 0), cfg["seed"])
-            df["has_images"] = df["client_id"].isin(with_images)
-            print(f"   positives={int((df['label'] == POSITIVE).sum())}  negatives={int((df['label'] != POSITIVE).sum())}"
-                  f"  selected for images={len(with_images)}")
-            export_ocr(con, df, ocr_dir, args.refresh_ocr)
+                    print(f"   WARNING: could not read the cross-brand record ({str(e).strip()[:100]})")
+                    common = pd.DataFrame(columns=COMMON_COLUMNS)
+            clients = fetch_clients(con, cfg["registered_since"])
+            clients = label_clients(clients, tenant, cfg, confirmed_customers(con, tenant, cfg, clients, forged))
+        df = add_common_info(clients[clients["label"].notna()], common)
+        df["tenant"] = tenant
+        print(f"   labeled customers: {counts(df)}")
+        labeled.append(df)
 
+    # 2. one row per person: a document number labeled in several tenants is kept once
+    everyone = pd.concat(labeled, ignore_index=True)
+    people = one_row_per_person(everyone, tenants)
+    people["anon_id"] = [anon_id(t, d) for t, d in zip(people["tenant"], people["document_number"])]
+    people["person_id"] = [person_id(d) for d in people["document_number"]]
+    print(f"== one row per person: {len(everyone)} labeled customers -> {len(people)} people "
+          f"({len(everyone) - len(people)} repeated rows removed, "
+          f"{int(people['label_conflict'].sum())} people with conflicting labels)")
+
+    # 3. choose who gets images and export the stored OCR of the kept rows
+    frames: dict[str, pd.DataFrame] = {}
+    for tenant in tenants:
+        df = people[people["tenant"] == tenant].copy()
+        with_images = set(df.loc[df["label"] == POSITIVE, "client_id"]) | \
+            sample_negatives(df, cfg["negatives_with_images"].get(tenant, 0), cfg["seed"])
+        df["has_images"] = df["client_id"].isin(with_images)
+        print(f"== {tenant}: {counts(df)}  selected for images={len(with_images)}")
+        if len(df):
+            with closing(pg_connection(tenant)) as con:
+                export_ocr(con, tenant, df, ocr_dir, args.refresh_ocr)
+        frames[tenant] = df
+
+    # 4. customers without text: reuse the text of the same person in the other tenant, identical images only
+    if borrow:
+        for tenant, df in frames.items():
+            for other in tenants:
+                if other == tenant or df.empty:
+                    continue
+                print(f"== {tenant}: looking in {other} for the text of customers that have none")
+                stats = borrow_ocr(tenant, df, other, ocr_dir, pg_connection, s3, cfg["bucket"], args.workers)
+                print("   " + "  ".join(f"{k}={v}" for k, v in stats.items()))
+
+    # 5. manifest rows, and images when requested
+    manifests, id_maps = [], []
+    for tenant, df in frames.items():
         df = df.merge(ocr_flags(ocr_dir, df["anon_id"]), on="anon_id", how="left")
-        if s3 is not None:
+        if not args.no_images:
             images = download_images(s3, cfg["bucket"], df[df["has_images"]], out, args.workers)
             df = df.merge(images, on="anon_id", how="left")
             errors = int(df.filter(regex="_error$").notna().any(axis=1).sum()) if len(images) else 0
             print(f"   images: {len(images)} customers, {errors} with a download error")
 
-        id_maps.append(df[["anon_id", "person_id", "tenant", "client_id", "document_number"]])
+        id_maps.append(df[["anon_id", "person_id", "tenant", "client_id", "document_number",
+                           "front_id_image", "back_id_image"]])  # S3 keys: used by 14_fresh_ocr.py
         manifests.append(df.drop(columns=["client_id", "document_number", "front_id_image", "back_id_image",
                                           "group", "has_both_images", "fraud_status"]))
 
@@ -182,20 +187,28 @@ def main():
     for side in SIDES:  # columns expected by the next scripts, even when no image was downloaded
         if f"{side}_path" not in manifest:
             manifest[f"{side}_path"] = None
-    first = ["anon_id", "person_id", "tenant", "label", "label_source", "registered_at", "registered_date",
-             "channel", "has_images", "front_path", "back_path"]
+    first = ["anon_id", "person_id", "tenant", "label", "label_source", "labeled_in", "registered_at",
+             "registered_date", "channel", "has_images", "front_path", "back_path"]
     manifest = manifest[first + [c for c in manifest.columns if c not in first]]
     for col in manifest.columns:
         if col.endswith(("_bytes", "_width", "_height")):
             manifest[col] = pd.to_numeric(manifest[col]).astype("Int64")
 
-    manifest = merge_with_existing(out / "manifest.csv", manifest, tenants)
     manifest.to_csv(out / "manifest.csv", index=False)
-    merge_with_existing(out / "private" / "id_map.csv", pd.concat(id_maps, ignore_index=True), tenants) \
-        .to_csv(out / "private" / "id_map.csv", index=False)
+    pd.concat(id_maps, ignore_index=True).to_csv(out / "private" / "id_map.csv", index=False)
 
-    print("\nSummary:")
+    print("\nSummary (tenant = the one whose row and photos were kept):")
     print(manifest.groupby(["tenant", "label", "label_source"]).size().to_string())
+    print("\nPeople per label:")
+    print(manifest.groupby("label").agg(
+        people=("anon_id", "size"),
+        labeled_in_several_tenants=("labeled_in", lambda s: int(s.str.contains("|", regex=False).sum()))).to_string())
+    text = manifest.assign(back_text=manifest["has_back_ocr"].astype(str) == "True",
+                           back_text_borrowed=manifest["back_ocr_from"].notna()
+                           & (manifest["back_ocr_from"] != manifest["tenant"]))
+    print("\nStored back-side text available (borrowed = taken from the other tenant, identical image):")
+    print(text.groupby(["tenant", "label"]).agg(people=("anon_id", "size"), back_text=("back_text", "sum"),
+                                                back_text_borrowed=("back_text_borrowed", "sum")).to_string())
     print(f"\nmanifest: {out / 'manifest.csv'}  ({len(manifest)} rows)")
     print("Reminder: data/ is git-ignored. private/id_map.csv holds real document numbers; never share it.")
 

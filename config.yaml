@@ -15,6 +15,27 @@ possible_fraud_windows:
     end: "2026-10-04"
     reason: "Store 623 fraud ring (docs/fraud-score): 65 confirmed + 16 flagged during the investigation"
 
+# Positives (c): fraud confirmed by the fraud team on 2026-11-12 that fraud_status may not show
+# yet. Same conditions as the others: no PAID credit, registered since `registered_since`, both
+# photos. Their label_source is CONFIRMED_<name>. scripts/16_check_new_positives.py counts them.
+#   credit_at_commerce       every customer with a credit at the commerce inside the window
+#   payout_bank_at_commerce  every customer with a credit paid out to that bank, requested at the
+#                            commerce (no dates: all of them)
+# Positives (d), not configured here: IDs an analyst confirmed as forged in the team's verifier,
+# read from data/<stage>/private/verifier_history/casos/ when it exists (label_source VERIFIER_ANALYST).
+confirmed_fraud_sources:
+  - name: AMORETT
+    tenant: esmio
+    kind: credit_at_commerce
+    commerce_like: "%AMORETT%"
+    start: "2026-10-14"
+    end: "2026-11-10"
+  - name: FINANDINA_LIBRE_DESTINO
+    tenant: esmio
+    kind: payout_bank_at_commerce
+    commerce_like: "%LIBRE DESTINO%"
+    bank_like: "%FINANDINA%"
+
 # Negatives (genuine ID): no fraud_status and at least one PAID credit.
 # Every negative goes into the manifest with metadata + OCR (to measure rule false positives);
 # only a stratified sample (by month and channel) is downloaded with images (to train the CNN).

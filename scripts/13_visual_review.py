@@ -44,9 +44,12 @@ if pending.empty:
 
 row = pending.iloc[0]
 c1, c2 = st.columns(2)
-c1.image(str(out / row.front_path), caption="front", use_container_width=True)
-c2.image(str(out / row.back_path), caption="back", use_container_width=True) if isinstance(row.back_path, str) \
-    else c2.warning("no back image")
+c1.image(str(out / row.front_path), caption="front", width="stretch")
+# A plain if/else: Streamlit cannot parse a bare expression that continues on the next line.
+if isinstance(row.back_path, str):
+    c2.image(str(out / row.back_path), caption="back", width="stretch")
+else:
+    c2.warning("no back image")
 st.write(f"**{row.anon_id}** · {row.tenant} · registered {str(row.registered_at)[:10]} · {row.channel} · {row.label_source}")
 
 modality = st.radio("Modality", MODALITIES, horizontal=True)

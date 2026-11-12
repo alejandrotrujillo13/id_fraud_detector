@@ -10,10 +10,15 @@ data/<stage>/checks/*.csv.
   4. by month          positives and negatives per registration month (input for the train/validation split)
   5. by channel        positives and negatives per channel (APP, COMMERCE, ...)
   6. NOVATED credits   labeled customers that have a NOVATED credit (not counted as PAID today)
-  7. OCR               on a sample: is the stored Rekognition text where the parser expects it?
-  8. both brands       labeled customers that also exist in the other tenant (same photos may be copied)
-  9. cross-brand flag  labeled customers whose cross-brand record carries a fraud flag
- 10. S3                can one image be read with the configured credentials? (skipped with --no-s3)
+  7. OCR               every positive and a sample of negatives: who has stored Rekognition text,
+                       by label source, by channel and by where the person was first validated
+  8. first validation  labeled customers whose person was already validated in some brand before
+                       registering here (their photos are copies of older ones, with no OCR here)
+  9. both brands       labeled customers that also exist in the other tenant (same photos may be copied)
+ 10. cross-brand flag  labeled customers whose cross-brand record carries a fraud flag
+ 11. S3                can one image be read with the configured credentials? (skipped with --no-s3)
+ 12. people            labeled customers of every tenant merged by document number, as the export
+                       does: how many people remain, repeated rows removed and label conflicts
 
 Usage:  python scripts/10_check_database.py [--ocr-sample 300] [--no-s3]
 """
@@ -24,8 +29,10 @@ from contextlib import closing
 import pandas as pd
 
 from id_fraud_detector.common import load_config, output_dir, pg_connection, query_df, s3_client, stage
-from id_fraud_detector.dataset import (NEGATIVE, POSITIVE, fetch_clients, fetch_common_fraud_status,
-                                       fetch_ocr_lines, label_clients)
+from id_fraud_detector.dataset import (NEGATIVE, POSITIVE, add_common_info, confirmed_customers, fetch_clients,
+                                       fetch_common_clients, fetch_ocr_lines, label_clients,
+                                       one_row_per_person)
+from id_fraud_detector.verifier import forged_by_analyst
 
 # Counts obtained by hand on sisteya_live on 2026-11-09 (docs/context.md §4.4 and §4.5):
 # (customers, with both images). They drift a little every day (new customers, credits that get
@@ -102,19 +109,49 @@ def novated_table(tenant: str, clients: pd.DataFrame) -> pd.DataFrame:
     return t
 
 
-def ocr_table(con, tenant: str, clients: pd.DataFrame, sample_size: int, seed: int) -> pd.DataFrame:
-    rows = []
-    for label in (POSITIVE, NEGATIVE):
-        group = clients[clients["label"] == label]
-        sample = group.sample(min(len(group), sample_size), random_state=seed)
-        found = {r["client_id"]: r for r in fetch_ocr_lines(con, sample["client_id"])}
-        n = len(sample)
-        front = sum(bool(r["front_lines"]) for r in found.values())
-        back = sum(bool(r["back_lines"]) for r in found.values())
-        rows.append({"tenant": tenant, "label": label, "sampled": n,
-                     "with_validation_row": len(found), "with_front_text": front, "with_back_text": back,
-                     "back_text_share": round(back / n, 3) if n else None})
-    return pd.DataFrame(rows)
+def ocr_sample(con, clients: pd.DataFrame, sample_size: int, seed: int) -> pd.DataFrame:
+    """One row per checked customer (every positive, up to `sample_size` negatives) with flags
+    telling whether Rekognition text is stored for the front and the back."""
+    labeled = clients[clients["label"].notna()]
+    negatives = labeled[labeled["label"] == NEGATIVE]
+    negatives = negatives.sample(min(len(negatives), sample_size), random_state=seed)
+    sample = pd.concat([labeled[labeled["label"] == POSITIVE], negatives]).copy()
+    found = {r["client_id"]: r for r in fetch_ocr_lines(con, sample["client_id"])}
+    sample["has_validation_row"] = sample["client_id"].isin(set(found))
+    sample["has_front_text"] = [bool(found.get(c, {}).get("front_lines")) for c in sample["client_id"]]
+    sample["has_back_text"] = [bool(found.get(c, {}).get("back_lines")) for c in sample["client_id"]]
+    sample["channel"] = sample["channel"].fillna("(empty)")
+    return sample
+
+
+def ocr_summary(tenant: str, sample: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+    if sample.empty:
+        return pd.DataFrame(columns=["tenant", *by, "checked", "with_validation_row", "with_front_text",
+                                     "with_back_text", "back_text_share"])
+    t = sample.groupby(by).agg(checked=("client_id", "size"), with_validation_row=("has_validation_row", "sum"),
+                               with_front_text=("has_front_text", "sum"),
+                               with_back_text=("has_back_text", "sum")).reset_index()
+    t["back_text_share"] = (t["with_back_text"] / t["checked"]).round(3)
+    t.insert(0, "tenant", tenant)
+    return t
+
+
+def first_validation_table(tenant: str, clients: pd.DataFrame, cutoff: str) -> pd.DataFrame:
+    """Labeled customers whose person was validated in some brand before registering in this one.
+    `first_validated_before_cutoff` counts those whose first validation (when the photos were
+    actually taken) is older than the registration cut-off of the dataset."""
+    labeled = clients[clients["label"].notna()].copy()
+    if labeled.empty:
+        return pd.DataFrame(columns=["tenant", "label", "label_source", "customers"])
+    old = labeled["validated_elsewhere_first"] & (labeled["common_validated_at"] < pd.Timestamp(cutoff, tz="UTC"))
+    labeled["first_validated_before_cutoff"] = old
+    t = labeled.groupby(["label", "label_source"]).agg(
+        customers=("client_id", "size"),
+        validated_elsewhere_first=("validated_elsewhere_first", "sum"),
+        first_validated_before_cutoff=("first_validated_before_cutoff", "sum")).reset_index()
+    t["elsewhere_share"] = (t["validated_elsewhere_first"] / t["customers"]).round(3)
+    t.insert(0, "tenant", tenant)
+    return t
 
 
 def ocr_structure(con, clients: pd.DataFrame) -> None:
@@ -157,16 +194,18 @@ def both_brands_table(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def common_flag_table(frames: dict[str, pd.DataFrame], common: pd.DataFrame) -> pd.DataFrame:
+def common_flag_table(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
     parts = []
     for tenant, df in frames.items():
-        labeled = df[df["label"].notna()].merge(common, on="document_number", how="left")
+        labeled = df[df["label"].notna()].copy()
+        if labeled.empty:
+            continue
         labeled["common_fraud_status"] = labeled["common_fraud_status"].fillna("(no flag)")
         t = labeled.pivot_table(index="label", columns="common_fraud_status", values="client_id",
                                 aggfunc="size", fill_value=0).reset_index()
         t.insert(0, "tenant", tenant)
         parts.append(t)
-    return pd.concat(parts, ignore_index=True).fillna(0)
+    return pd.concat(parts, ignore_index=True).fillna(0) if parts else pd.DataFrame()
 
 
 def check_s3(bucket: str, frames: dict[str, pd.DataFrame]) -> None:
@@ -188,9 +227,32 @@ def check_s3(bucket: str, frames: dict[str, pd.DataFrame]) -> None:
             print(f"   {tenant}: FAILED under {prefix}/ -> {str(e)[:150]}")
 
 
+def people_table(frames: dict[str, pd.DataFrame], tenants: list[str]) -> pd.DataFrame:
+    """Labeled customers of every tenant merged by document number, with the rule of the export
+    (dataset.one_row_per_person). kept_from_<tenant> = people whose kept row is of that tenant."""
+    kept_columns = [f"kept_from_{tenant}" for tenant in tenants]
+    columns = ["label", "labeled_customers", "people", "repeated_rows_removed", "labeled_in_several_tenants",
+               "label_conflicts", *kept_columns]
+    labeled = pd.concat([df[df["label"].notna()].assign(tenant=tenant) for tenant, df in frames.items()],
+                        ignore_index=True)
+    if labeled.empty:
+        return pd.DataFrame(columns=columns)
+    people = one_row_per_person(labeled, tenants)
+    rows = []
+    for label, group in people.groupby("label"):
+        before = int(labeled["document_number"].isin(group["document_number"]).sum())
+        rows.append({"label": label, "labeled_customers": before, "people": len(group),
+                     "repeated_rows_removed": before - len(group),
+                     "labeled_in_several_tenants": int(group["labeled_in"].str.contains("|", regex=False).sum()),
+                     "label_conflicts": int(group["label_conflict"].sum()),
+                     **{f"kept_from_{tenant}": int((group["tenant"] == tenant).sum()) for tenant in tenants}})
+    return pd.DataFrame(rows, columns=columns)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ocr-sample", type=int, default=300, help="customers per tenant and label for the OCR check")
+    ap.add_argument("--ocr-sample", type=int, default=300,
+                    help="negatives per tenant for the OCR check (every positive is always checked)")
     ap.add_argument("--no-s3", action="store_true", help="skip the S3 access check")
     args = ap.parse_args()
 
@@ -200,8 +262,10 @@ def main():
     checks_dir.mkdir(parents=True, exist_ok=True)
 
     frames: dict[str, pd.DataFrame] = {}
-    tables: dict[str, list] = {"groups": [], "labels": [], "by_month": [], "by_channel": [], "novated": [], "ocr_sample": []}
-    common, common_error = None, None
+    tables: dict[str, list] = {"groups": [], "labels": [], "by_month": [], "by_channel": [], "novated": [],
+                               "ocr_by_source": [], "ocr_by_origin": [], "ocr_by_channel": [],
+                               "first_validation": []}
+    common, common_error, common_tried = None, None, False
 
     for tenant in cfg["tenants"]:
         print(f"\n################ {tenant} ################")
@@ -209,7 +273,16 @@ def main():
             section("1. connection")
             check_connection(con)
 
-            clients = label_clients(fetch_clients(con, cfg["registered_since"]), tenant, cfg)
+            if not common_tried:  # cross-brand record: one table for every tenant
+                common_tried = True
+                try:
+                    common = fetch_common_clients(con)
+                except Exception as e:
+                    common_error = str(e).strip()[:300]
+            clients = fetch_clients(con, cfg["registered_since"])  # same labeling as 11_export_dataset.py
+            clients = label_clients(clients, tenant, cfg, confirmed_customers(
+                con, tenant, cfg, clients, forged_by_analyst(output_dir(cfg))))
+            clients = add_common_info(clients, common)
             frames[tenant] = clients
 
             section(f"2. groups (registered since {cfg['registered_since']}); live reference = customers (with both images)")
@@ -238,46 +311,59 @@ def main():
             tables["novated"].append(novated_table(tenant, clients))
             show(tables["novated"][-1])
 
-            section(f"7. stored OCR on a sample of up to {args.ocr_sample} customers per label")
+            section(f"7. stored OCR: every positive and up to {args.ocr_sample} negatives")
             try:
-                ocr = ocr_table(con, tenant, clients, args.ocr_sample, cfg["seed"])
-                tables["ocr_sample"].append(ocr)
-                show(ocr)
-                if ocr["with_back_text"].sum() == 0 and ocr["with_validation_row"].sum() > 0:
+                sample = ocr_sample(con, clients, args.ocr_sample, cfg["seed"])
+                for name, by, title in (
+                        ("ocr_by_source", ["label", "label_source"], "by label source"),
+                        ("ocr_by_origin", ["label", "validated_elsewhere_first"],
+                         "by origin (validated_elsewhere_first = photos copied from an earlier validation)"),
+                        ("ocr_by_channel", ["label", "channel"], "by channel")):
+                    tables[name].append(ocr_summary(tenant, sample, by))
+                    print(f"   -- {title}")
+                    show(tables[name][-1])
+                if len(sample) and not sample["has_back_text"].any() and sample["has_validation_row"].any():
                     print("   No text found where the parser expects it. JSON keys actually stored:")
                     ocr_structure(con, clients)
             except Exception as e:
                 print(f"   FAILED: {str(e).strip()[:300]}")
 
-            if common is None and common_error is None:
-                try:
-                    common = fetch_common_fraud_status(con)
-                except Exception as e:
-                    common_error = str(e).strip()[:300]
+            section("8. labeled customers whose person was validated in some brand before registering here")
+            if common is None:
+                print(f"   could not be checked: {common_error}")
+            else:
+                tables["first_validation"].append(first_validation_table(tenant, clients, cfg["registered_since"]))
+                show(tables["first_validation"][-1])
 
     print("\n################ across tenants ################")
-    section("8. labeled customers that also exist in the other tenant (registered since the cut-off date)")
+    section("9. labeled customers that also exist in the other tenant (registered since the cut-off date)")
     both = both_brands_table(frames)
     show(both)
 
-    section("9. fraud flag on the cross-brand record (public.customers_commonclient) of labeled customers")
+    section("10. fraud flag on the cross-brand record (public.customers_commonclient) of labeled customers")
     flags = None
     if common is None:
         print(f"   could not be checked: {common_error}")
     else:
-        flags = common_flag_table(frames, common)
+        flags = common_flag_table(frames)
         show(flags)
 
-    section("10. S3 access")
+    section("11. S3 access")
     if args.no_s3:
         print("   skipped (--no-s3)")
     else:
         check_s3(cfg["bucket"], frames)
 
+    section("12. people: labeled customers of every tenant merged by document number (one row per person)")
+    people = people_table(frames, cfg["tenants"])
+    show(people)
+    print("   label_conflicts = positive in one tenant and negative in another; they are kept as POSITIVE.")
+
     for name, parts in tables.items():
         if parts:
             pd.concat(parts, ignore_index=True).fillna(0).to_csv(checks_dir / f"{name}.csv", index=False)
     both.to_csv(checks_dir / "both_brands.csv", index=False)
+    people.to_csv(checks_dir / "people.csv", index=False)
     if flags is not None:
         flags.to_csv(checks_dir / "common_fraud_flag.csv", index=False)
     print(f"\nAggregated tables saved in {checks_dir} (counts only, no personal data).")
