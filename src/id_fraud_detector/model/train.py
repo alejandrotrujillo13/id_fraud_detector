@@ -29,7 +29,7 @@ class TrainConfig:
     tune_lr: float = 1e-4
     weight_decay: float = 1e-4
     batch_size: int = 32
-    patience: int = 8
+    patience: int = 6
     seed: int = 42
 
     def as_dict(self) -> dict:
@@ -80,9 +80,11 @@ def predict(model: nn.Module, photos: np.ndarray, indices: np.ndarray, device, b
     return np.array([merged[int(i)] for i in indices])
 
 
-def fit(model: nn.Module, photos: np.ndarray, labels: np.ndarray, train_idx: np.ndarray, val_idx: np.ndarray,
+def fit(model: nn.Module, photos: np.ndarray, labels: np.ndarray, train_idx: np.ndarray, val_idx: np.ndarray | None,
         cfg: TrainConfig, device, log=print) -> list[dict]:
     """Train `model` in place and leave it with the weights of its best validation epoch.
+    With `val_idx` None there is nothing to watch (the final model, trained on everyone): it
+    trains exactly the epochs of the configuration and keeps the weights of the last one.
     `photos` is the uint8 array of every person, `labels` 1 = forged, 0 = genuine. Returns the
     history: one row per epoch, with the loss and the accuracy (threshold 0.5) on training and
     on validation, and the validation PR-AUC, which is the one that decides the best epoch. The
@@ -93,7 +95,7 @@ def fit(model: nn.Module, photos: np.ndarray, labels: np.ndarray, train_idx: np.
     positives, negatives = int(y_train.sum()), int((y_train == 0).sum())
     pos_weight = negatives / max(1, positives)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
-    y_val = labels[val_idx].astype(bool)
+    y_val = None if val_idx is None else labels[val_idx].astype(bool)
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
     history, best, best_state, since_best = [], -1.0, None, 0
 
@@ -124,6 +126,12 @@ def fit(model: nn.Module, photos: np.ndarray, labels: np.ndarray, train_idx: np.
                 losses.append(float(loss.detach()))
                 hits += int(((logits.detach() > 0) == (y > 0.5)).sum())
                 seen += len(batch)
+            if val_idx is None:
+                row = {"stage": stage, "epoch": epoch, "train_loss": round(float(np.mean(losses)), 4),
+                       "train_accuracy": round(hits / max(1, seen), 4)}
+                history.append(row)
+                log(f"      {stage} {epoch:2d}  loss {row['train_loss']:.4f}  accuracy {row['train_accuracy']:.4f}")
+                continue
             scores = predict(model, photos, val_idx, device)
             val_pr_auc = average_precision(labels[val_idx], scores)
             clipped = np.clip(scores, 1e-7, 1 - 1e-7)

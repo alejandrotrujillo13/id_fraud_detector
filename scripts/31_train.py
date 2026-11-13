@@ -14,9 +14,15 @@ Everything is left in runs/<name>/ (never in git):
   metrics_*.csv          overall, by fold, by channel and by label source
   fold<k>.pt             weights of the model of each fold
 
+With --final it trains the model for new customers instead: one network on everyone, with no
+fold held out and a fixed number of epochs taken from a cross-validation run of the same recipe
+(--epochs-from: the median of the epochs its five folds kept). That model has no score of its
+own to report; its expected result is the one of the cross-validation. It leaves final.pt.
+
 Usage:  python scripts/31_train.py --side back
         python scripts/31_train.py --side front [--arch efficientnet_b0] [--size 512x320]
         python scripts/31_train.py --side back --limit 400 --epochs 2 --folds 0     quick trial
+        python scripts/31_train.py --side front --arch efficientnet_b0 --final --epochs-from runs/<cv run>
 """
 import argparse
 import json
@@ -24,6 +30,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -31,7 +38,7 @@ import torch
 
 from id_fraud_detector.common import ROOT, image_path, load_config, output_dir
 from id_fraud_detector.evaluation import metrics
-from id_fraud_detector.model.data import build_cache
+from id_fraud_detector.model.data import build_cache, excluded_by_review
 from id_fraud_detector.model.net import ARCHITECTURES, build
 from id_fraud_detector.model.train import TrainConfig, fit, predict
 
@@ -46,12 +53,23 @@ def people_table(out, limit: int | None, seed: int) -> pd.DataFrame:
     people = pd.read_csv(splits).merge(manifest, on="anon_id", how="inner", validate="one_to_one")
     people["channel"] = people["channel"].fillna("(none)")
     people["positive"] = people["label"] == "POSITIVE"
+    # Kept in the table (the cache of photos holds them) but never trained on, watched or scored.
+    people["excluded"] = people["anon_id"].isin(excluded_by_review(out)) & people["positive"]
     if limit is not None and limit < len(people):  # quick trial: keep the share of positives
         positives = people[people["positive"]]
         keep_positives = max(10, round(limit * len(positives) / len(people)))
         people = pd.concat([positives.sample(min(len(positives), keep_positives), random_state=seed),
                             people[~people["positive"]].sample(limit - keep_positives, random_state=seed)])
     return people.sort_values("anon_id").reset_index(drop=True)
+
+
+def kept_epochs(run) -> tuple[list[int], int]:
+    """Epoch kept by each fold of a cross-validation run (counted through both stages) and how
+    many of its epochs trained only the head."""
+    history = pd.read_csv(run / "history.csv")
+    kept = [int(part.reset_index(drop=True)["val_pr_auc"].idxmax()) + 1 for _, part in history.groupby("fold")]
+    head = int((history[history["fold"] == history["fold"].iloc[0]]["stage"] == "head").sum())
+    return kept, head
 
 
 def git_commit() -> str | None:
@@ -97,12 +115,16 @@ def main():
     ap.add_argument("--blocks", type=int, help="blocks of the base released in the second stage (default 6; all from scratch)")
     ap.add_argument("--lr", type=float, help="learning rate of the second stage (default 1e-4; 1e-3 from scratch)")
     ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--patience", type=int, default=8, help="epochs without improving before stopping")
+    ap.add_argument("--patience", type=int, default=6, help="epochs without improving before stopping")
+    ap.add_argument("--dropout", type=float, help="dropout before the output (default: the 0.2 of the network)")
+    ap.add_argument("--weight-decay", type=float, default=1e-4, help="weight decay of the optimizer")
     ap.add_argument("--seed", type=int, help="seed of the weights and of the batch order (default: the one in config.yaml). "
                                              "The split does not change")
     ap.add_argument("--folds", help="test folds to run, for example 0,1 (default: all)")
     ap.add_argument("--limit", type=int, help="quick trial with this many people")
     ap.add_argument("--name", help="name of the run folder (default: side, architecture, size and time)")
+    ap.add_argument("--final", action="store_true", help="train the model for new customers: everyone, no fold held out")
+    ap.add_argument("--epochs-from", metavar="RUN", help="with --final: cross-validation run that gives the number of epochs")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -112,8 +134,11 @@ def main():
     n_folds = int(people["fold"].max()) + 1
     test_folds = [int(f) for f in args.folds.split(",")] if args.folds else list(range(n_folds))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"people: {len(people)}  positives: {int(people['positive'].sum())}  side: {args.side}  "
+    used = ~people["excluded"].to_numpy()
+    print(f"people: {int(used.sum())}  positives: {int((people['positive'] & used).sum())}  side: {args.side}  "
           f"model: {args.arch}  input: {size[0]}x{size[1]}")
+    if not used.all():
+        print(f"left out: {int((~used).sum())} positives that the visual review found to be genuine documents")
     print(f"device: {torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU (no GPU found: this will be slow)'}")
 
     paths = [image_path(out, r.tenant, r.label, r.anon_id, args.side) for r in people.itertuples(index=False)]
@@ -128,32 +153,64 @@ def main():
     def choice(given, pretrained_default, scratch_default):
         return given if given is not None else (scratch_default if scratch else pretrained_default)
 
+    reference = None
+    if args.final:
+        if args.folds:
+            sys.exit("ERROR: --final trains on everyone; it does not take --folds.")
+        if args.epochs_from:
+            kept, head = kept_epochs(ROOT / args.epochs_from if not Path(args.epochs_from).is_absolute() else Path(args.epochs_from))
+            total = int(np.median(kept))
+            args.head_epochs = head if args.head_epochs is None else args.head_epochs
+            args.epochs = max(1, total - args.head_epochs)
+            reference = {"run": args.epochs_from, "kept_epochs": kept, "median": total}
+            print(f"epochs kept by the folds of {args.epochs_from}: {kept} -> {args.head_epochs} of the head + {args.epochs}")
+        elif args.epochs is None:
+            sys.exit("ERROR: --final needs --epochs-from RUN (or --epochs): there is no validation fold to stop it.")
+    elif args.epochs_from:
+        sys.exit("ERROR: --epochs-from only goes with --final.")
     name = args.name or (f"{args.side}_{args.arch}{'_scratch' if scratch else ''}_{size[0]}x{size[1]}"
-                         f"{'' if args.seed is None else f'_seed{seed}'}_{datetime.now():%Y%m%d_%H%M}")
+                         f"{'' if args.seed is None else f'_seed{seed}'}{'_final' if args.final else ''}"
+                         f"_{datetime.now():%Y%m%d_%H%M}")
     run_dir = ROOT / "runs" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     train_cfg = TrainConfig(head_epochs=choice(args.head_epochs, 3, 0), tune_epochs=choice(args.epochs, 20, 40),
                             trainable_blocks=choice(args.blocks, 6, 99), tune_lr=choice(args.lr, 1e-4, 1e-3),
-                            batch_size=args.batch, patience=args.patience, seed=seed)
+                            weight_decay=args.weight_decay, batch_size=args.batch, patience=args.patience, seed=seed)
     if scratch:
         print("no transfer learning: random initial weights, the whole network is trained")
     (run_dir / "config.json").write_text(json.dumps({
-        "side": args.side, "arch": args.arch, "pretrained": not scratch, "size": list(size), "people": len(people),
-        "positives": int(labels.sum()), "test_folds": test_folds, "limit": args.limit, "train": train_cfg.as_dict(),
+        "side": args.side, "arch": args.arch, "pretrained": not scratch, "dropout": args.dropout, "size": list(size),
+        "people": int(used.sum()), "excluded_by_review": int((~used).sum()),
+        "positives": int(labels[used].sum()), "test_folds": [] if args.final else test_folds, "final": args.final,
+        "epochs_from": reference, "limit": args.limit, "train": train_cfg.as_dict(),
         "torch": torch.__version__, "device": str(device), "commit": git_commit(),
         "started": datetime.now().isoformat(timespec="seconds")}, indent=2), encoding="utf-8")
+
+    if args.final:
+        started = time.time()
+        train_idx = np.flatnonzero(used)
+        print()
+        print(f"== final model: train {len(train_idx)} ({int(labels[train_idx].sum())} positives), nothing held out")
+        torch.manual_seed(seed)
+        model = build(args.arch, pretrained=not scratch, dropout=args.dropout).to(device)
+        history = fit(model, photos, labels, train_idx, None, train_cfg, device)
+        torch.save(model.state_dict(), run_dir / "final.pt")
+        pd.DataFrame(history).to_csv(run_dir / "history.csv", index=False)
+        print()
+        print(f"final model saved in {run_dir / 'final.pt'}   ({(time.time() - started) / 60:.1f} min)")
+        return
 
     scored, history = [], []
     for fold in test_folds:
         started = time.time()
         val_fold = (fold + 1) % n_folds
-        test_idx = np.flatnonzero(folds == fold)
-        val_idx = np.flatnonzero(folds == val_fold)
-        train_idx = np.flatnonzero((folds != fold) & (folds != val_fold))
+        test_idx = np.flatnonzero((folds == fold) & used)
+        val_idx = np.flatnonzero((folds == val_fold) & used)
+        train_idx = np.flatnonzero((folds != fold) & (folds != val_fold) & used)
         print(f"\n== fold {fold}: train {len(train_idx)} ({int(labels[train_idx].sum())} positives)  "
               f"validation {len(val_idx)} ({int(labels[val_idx].sum())})  test {len(test_idx)} ({int(labels[test_idx].sum())})")
         torch.manual_seed(seed + fold)
-        model = build(args.arch, pretrained=not scratch).to(device)
+        model = build(args.arch, pretrained=not scratch, dropout=args.dropout).to(device)
         fold_cfg = TrainConfig(**{**train_cfg.as_dict(), "seed": seed + fold})
         history += [{"fold": fold, **row} for row in fit(model, photos, labels, train_idx, val_idx, fold_cfg, device)]
         part = people.iloc[test_idx][["anon_id", "fold", "label", "label_source", "channel", "positive"]].copy()

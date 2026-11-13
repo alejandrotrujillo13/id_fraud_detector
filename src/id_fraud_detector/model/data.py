@@ -19,6 +19,19 @@ from tqdm import tqdm
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+GENUINE_DOCUMENT = "genuine_doc_stolen_identity"  # answer of the visual review (13_visual_review.py)
+
+
+def excluded_by_review(out: Path) -> set[str]:
+    """People left out of training and of its metrics: positives whose ID a person looked at and
+    found genuine (a real, stolen document: the fraud was the identity, not a forgery, so the
+    photo is not an example of what this model looks for). They are not turned into negatives:
+    the negatives stay defined by one rule, a paid credit and no fraud flag."""
+    review = out / "review" / "modalities.csv"
+    if not review.exists():
+        return set()
+    answers = pd.read_csv(review, usecols=["anon_id", "modality"])
+    return set(answers.loc[answers["modality"] == GENUINE_DOCUMENT, "anon_id"])
 
 
 def reduced(image: Image.Image, size: tuple[int, int]) -> np.ndarray:

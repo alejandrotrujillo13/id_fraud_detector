@@ -501,9 +501,92 @@ puntaje que solo usa esos datos.
 Quedan 54 positivos sin detectar (4 fallan alguna regla): `runs/ensemble/missed_positives.csv`.
 De los 88 que no detectaba el primer modelo, el promedio recupera 35 y pierde 1.
 
+### 13.4 Revisión visual de los 54 no detectados
+
+Alejandro miró las dos fotos de cada uno (13-nov-2026, `data/live/review/modalities.csv`), sin
+ver los puntajes del modelo:
+
+| Qué se ve | Casos | Origen | Canal |
+|---|---|---|---|
+| Cédula falsificada | 48 | 41 `FRAUD`, 6 tienda 623, 1 AMORETT | 39 comercio, 9 app |
+| Cédula que se ve auténtica | 3 | 3 `FRAUD` de 2025 | 3 comercio |
+| No se puede decidir | 3 | 3 `FRAUD` | 3 comercio |
+
+Casi todo lo que el modelo deja pasar son falsificaciones que una persona sí reconoce: los
+fallos son del modelo, no de la etiqueta. Si se sacan de los positivos las 3 que se ven
+auténticas, la detección sería 356 de 407 (87,5 %); no se usa como cifra principal porque solo
+se revisaron los no detectados. La revisión no fue a ciegas: quien revisó sabía que todos los
+casos estaban marcados como fraude.
+
+Las 3 que se ven auténticas son cédulas reales robadas (la selfie no coincidía con la foto del
+documento). Desde el 13-nov-2026 se excluyen del entrenamiento y de sus métricas. Sin ellas,
+EfficientNet-B0 sola (el modelo final) detecta 353 de 407 (86,7 %); con ellas como positivos,
+353 de 410 (86,1 %).
+
+### 13.5 Prueba de regularización y de la paciencia (EfficientNet-B0)
+
+Cuatro corridas del 13-nov-2026 con paciencia 6. La receta regularizada usa decaimiento de pesos
+0,01, dropout 0,5 y 3 bloques liberados en vez de 6. Detección con 2 % de falsos positivos:
+
+| | Receta actual | Regularizada | Diferencia [IC 95 %] |
+|---|---|---|---|
+| Frente | 79,0 % (324 de 410) | 75,9 % (311) | −3,2 [−7,1; +0,7] |
+| Reverso | 68,5 % (281) | 62,7 % (257) | −5,9 [−10,3; −1,0] |
+| Promedio de las dos caras | 86,1 % (353) | 82,4 % (338) | −3,7 [−6,1; −0,5] |
+| PR-AUC de las dos caras | 0,88 | 0,87 | |
+| Red nunca vista (100) | 94 | 84 | |
+
+La regularización no mejora la detección y la pérdida de validación sigue subiendo después de las
+épocas 5 a 8. Se conserva la receta actual.
+
+La misma red con distinta paciencia (misma semilla, así que solo cambia dónde se corta):
+
+| Paciencia | Frente | Reverso | Las dos caras |
+|---|---|---|---|
+| 4 | 78,8 % (323) | 68,5 % (281) | 86,6 % (355) |
+| 6 | 79,0 % (324) | 68,5 % (281) | 86,1 % (353) |
+| 8 | sin correr | 71,7 % (294) | |
+
+La diferencia del reverso con paciencia 8 viene del modelo de una sola de las cinco partes.
+
+### 13.6 Formas de combinar frente y reverso
+
+Medido con los puntajes guardados (13-nov-2026); los pesos se ajustan con cuatro partes y se
+aplican a la quinta. Detección con 2 % de falsos positivos:
+
+| Forma de combinar | Cuatro variantes | EfficientNet-B0 sola |
+|---|---|---|
+| Promedio simple (lo que se usa) | 86,8 % (356) | 86,1 % (353) |
+| Máximo de los dos | 84,9 % (348) | 84,1 % (345) |
+| Regresión logística sobre los dos puntajes | 87,1 % (357) | 84,9 % (348) |
+| Promedio de los logits | 86,3 % (354) | 87,3 % (358) |
+
+Ninguna diferencia con el promedio simple sale del ruido. De los 410 positivos (cuatro
+variantes), 267 los marcan las dos caras, 66 solo el frente, 27 solo el reverso y 50 ninguna.
+
+### 13.7 Caras repetidas entre cédulas
+
+`scripts/36_face_repeats.py` (13-nov-2026) compara la cara del frente de las 5.707 personas. Dos
+caras coinciden si dos personas distintas coincidirían por azar una vez cada 100.000 pares.
+
+| | Cifra |
+|---|---|
+| Positivos con cara encontrada | 394 de 410 (96 %) |
+| Negativos con cara encontrada | 4.497 de 5.297 (85 %) |
+| Pares de positivos que coinciden | 9 (0,8 esperados por azar) |
+| Positivos con la cara de otro positivo | 12 (todos `FRAUD`) |
+| De ellos, con la cara en el entrenamiento de su modelo | 5 |
+| Caras repetidas dentro de la red tienda 623 + AMORETT | 0 |
+| Detección del frente: cara vista en el entrenamiento | 4 de 5 |
+| Detección del frente: sin cara repetida | 318 de 382 (83 %) |
+| Detección de las dos caras sin esos 5 positivos | 86,9 % |
+
+Las caras repetidas existen pero son pocas y no se detectan mejor que las demás. No se midió
+cuántas se le escapan al comparador.
+
 ## 14. Lo que falta medir
 
-- Los mapas de calor (Grad-CAM) y la revisión a ojo de los 54 positivos que el promedio de las cuatro variantes no detecta.
+- Los mapas de calor (Grad-CAM), para ver qué mira el modelo en las 48 falsificaciones que no detecta.
 - Repetir EfficientNet-B0 con otras semillas, si se quiere afirmar que es mejor que MobileNetV3.
 - La calibración del puntaje a 0–100 y el backtest.
 - El texto de los 22.586 negativos que no se han leído (unos 45 USD). Se dejó sin leer porque

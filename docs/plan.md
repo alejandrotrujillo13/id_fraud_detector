@@ -25,6 +25,8 @@ Esta sección resume lo que se midió y decidió al cerrar la fase 1. **Donde el
 4. **Recorte.** El primer modelo se entrena **sin recortar**, con la foto completa reducida. La cédula ya ocupa cerca del 75 % del ancho del cuadro. Si ese modelo queda corto, se compara contra una versión recortada (por las cajas de texto de Rekognition o con un detector).
 5. **Evaluación.** **Validación cruzada en cinco partes por persona**, con cada red completa (tienda 623, AMORETT) dentro de una sola parte, para medir si el modelo reconoce falsificaciones y no la plantilla de una red. Llévalo Ya tiene 20 positivos y no sirve como prueba externa. Los resultados se reportan por canal y por origen del positivo.
 6. **Revisión visual.** Aplazada: se revisan a ojo solo los positivos que el primer modelo no detecte.
+7. **Modelo final (13-nov-2026, por ahora).** **EfficientNet-B0, una red por cara** (dos redes al puntuar), con la receta de la validación cruzada y sin regularización adicional. El puntaje es el **promedio simple** del frente y el reverso. En la validación cruzada detecta entre el 86,1 % y el 86,6 % de los positivos con 2 % de falsos positivos; el promedio de cuatro variantes (ocho redes) da 86,8 %, una diferencia que no se distingue del ruido. Se prefiere por ser más simple y más rápido como servicio: unos 0,3 s por cliente en CPU contra 0,9 s. Alejandro puede revisarlo si la calibración o el backtest muestran que una sola red es inestable.
+8. **Cédulas auténticas robadas (13-nov-2026).** Tres positivos `FRAUD` de 2025 son cédulas auténticas usadas por otra persona: la selfie no coincidía con la foto del documento. El modelo busca falsificaciones, así que **se excluyen del entrenamiento y de sus métricas** (no pasan a negativos: los negativos se siguen definiendo solo por crédito pagado y sin marca). Ese fraude lo deben alertar las demás verificaciones (rostro contra selfie) cuando el indicador se combine con ellas. Se identifican por la respuesta de la revisión visual (`data/<STAGE>/review/modalities.csv`).
 
 ---
 
@@ -171,7 +173,7 @@ Cuando un cliente termina de tomar las fotos, el sistema haría lo siguiente, en
 
 **Paso 4 — Análisis del reverso.** La red del reverso hace lo mismo sobre la zona de huella, firma, código de barras y seriales. En los fraudes conocidos el reverso venía de una plantilla reutilizada, así que la red aprende a reconocer esas plantillas y las anomalías de impresión asociadas. También produce su mapa de calor.
 
-**Paso 5 — Riesgo final.** Las dos probabilidades y las señales del paso 1 se combinan (promedio ponderado o regresión logística pequeña) y se calibran a una escala 0–100. Con umbrales iniciales: menos de 40 sigue el flujo normal, 40–70 va a validación manual con los mapas de calor adjuntos, más de 70 se retiene. Los umbrales se fijan sobre datos históricos para que la franja de revisión no supere el ~2 % de clientes legítimos (hoy la política de fraude manda a revisión el 1,6 %).
+**Paso 5 — Riesgo final.** Las dos probabilidades se promedian (medido el 2026-11-13: ni los pesos ajustados ni una regresión logística superan al promedio simple) y, junto con las reglas, se calibran a una escala 0–100. Con umbrales iniciales: menos de 40 sigue el flujo normal, 40–70 va a validación manual con los mapas de calor adjuntos, más de 70 se retiene. Los umbrales se fijan sobre datos históricos para que la franja de revisión no supere el ~2 % de clientes legítimos (hoy la política de fraude manda a revisión el 1,6 %).
 
 **Paso 6 — Registro e integración.** El riesgo, las dos probabilidades, los mapas de calor y las señales de metadatos se guardan en `CustomerIdValidationResult` (nuevo campo JSON `data_doc_risk`). El motor de puntaje de fraude lee ese valor como una regla más (`FV_DOC_IMAGE_RISK`, con puntos según la franja). Arranca en modo **SHADOW**: calcula y registra pero no bloquea; cuando se compruebe en producción que los que marca son fraude, pasa a ENFORCE. El analista, en el panel de revisión, ve la cédula con el mapa de calor y el riesgo, y su decisión final (fraude / legítimo) alimenta el reentrenamiento.
 
@@ -289,7 +291,7 @@ Reglas de organización:
 | 2. Recorte | 1 sem | Hecho el 2026-11-12: el recorte con OpenCV encontró la cédula en 4 de 188 fotos. Se entrena sin recorte y se retoma solo si el primer modelo queda corto | OpenCV; Taller 2 (YOLO) solo si falla |
 | 3. Modelo | 3–4 sem | Redes de frente y reverso por transferencia (PyTorch, foto completa); validación cruzada en cinco partes por persona; métricas por canal y origen, Grad-CAM | Taller 1 (MobileNetV3), Gatos/Perros |
 | 4. Iteración | 2 sem | Según análisis de errores: resolución, zonas, residuo de ruido, sintéticos para modalidades escasas | — |
-| 5. Indicador y backtest | 1 sem | Calibración 0–100, umbrales, backtest histórico, prueba externa en Llévalo Ya | `05-backtest-esmio.html` |
+| 5. Indicador y backtest | 1 sem | Calibración 0–100 y umbrales con los puntajes de la validación cruzada; backtest histórico; modelo final entrenado con todos los datos y la receta ya fija (no tiene parte de prueba: su resultado es el de la validación cruzada) | `05-backtest-esmio.html` |
 | 6. Integración (opcional) | 2 sem | Servicio de inferencia (Lambda container o SageMaker), campo `data_doc_risk`, regla `FV_DOC_IMAGE_RISK` en SHADOW, mapa de calor en el panel de revisión | `docs/fraud-score/03-plan.html` |
 
 El proyecto de grado queda completo con las fases 1, 2, 3 y 5. Las fases 4 y 6 son mejora e integración; si no alcanzan, se presentan como trabajo futuro. Metodología: CRISP-DM (fases 1–5 corresponden a comprensión de datos, preparación, modelado y evaluación; la 6 a despliegue), con MLOps nivel 0 inicialmente.
@@ -306,6 +308,16 @@ El proyecto de grado queda completo con las fases 1, 2, 3 y 5. Las fases 4 y 6 s
 | Las reglas casi no se pueden evaluar en comercio (la cámara no deja leer el código) | El clasificador es el componente principal; se recomienda a la empresa exigir una resolución mínima en la captura de comercio |
 | Dos tipos de cédula con apariencia distinta | Incluir ambos desde el inicio y reportar métricas por tipo |
 | El estafador cambia de método | Modo SHADOW con monitoreo; reentrenamiento con lo que marque el analista; trabajo futuro en detección de anomalías |
+
+### 8.1 Propuestas de mejora para la empresa (Alejandro, 2026-11-13)
+
+No son parte de este proyecto; van en el informe como recomendaciones, cada una con lo que se midió aquí.
+
+| Propuesta | Qué la respalda |
+|---|---|
+| **Mejorar la captura de las fotos**, sobre todo en comercio: resolución mínima y validación de nitidez antes de aceptar la foto | En comercio con fotos de hasta 700 px de ancho el modelo detecta el 41 a 59 % de los positivos, contra cerca del 87 % en general. El código del reverso se lee en el 12 a 21 % de las fotos de comercio y en el 60 % de las de app, y las reglas dependen de leerlo |
+| **Registrar el motivo de cada fraude** al marcarlo: cédula falsificada (y de qué forma), cédula auténtica robada, u otro | Hoy `fraud_status` no distingue los casos. Tres positivos resultaron ser cédulas auténticas robadas y solo se supo por la revisión visual de los 54 no detectados; entre los detectados no se sabe cuántas hay. Con el motivo, las etiquetas del modelo serían solo falsificaciones |
+| **Reentrenar el modelo** cuando haya fotos de mejor calidad y etiquetas con motivo | El límite actual es de datos: 410 positivos, de los que solo se sabe que son fraude. Más regularización, otra forma de combinar las caras y una entrada más grande no mejoraron el resultado |
 
 ---
 

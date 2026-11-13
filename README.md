@@ -49,6 +49,10 @@ scripts/                    puntos de entrada; el primer dígito es la fase
   31_train.py               fase 3 · entrena el clasificador de una cara con validación cruzada
   32_audit_run.py           fase 3 · revisa si el modelo sigue la falsificación o la cámara y la fecha
   33_combine_sides.py       fase 3 · un puntaje por persona con frente y reverso, más las reglas
+  34_plot_history.py        fase 3 · curvas de pérdida y exactitud de una corrida
+  35_grad_cam.py            fase 3 · mapas de calor: dónde mira la red
+  36_face_repeats.py        fase 3 · caras repetidas entre cédulas y su efecto en la detección
+  50_calibrate.py           fase 5 · calibra el puntaje, pesa las reglas y arma el indicador
   20_crop_test.py           fase 2 · hoja de contacto para juzgar el recorte en 50 fotos por tenant
 tests/                      pruebas con datos sintéticos (reglas, etiquetado, conexión)
 data/<STAGE>/               (git-ignored) dataset, OCR, imágenes, resultados; private/ tiene datos reales
@@ -340,6 +344,8 @@ Opciones para comparar variantes (cada corrida queda en su propia carpeta de `ru
 | `--arch efficientnet_b0` | Otra red preentrenada |
 | `--seed 7` | Repite con otra semilla (la partición no cambia): mide cuánto varía el resultado |
 | `--blocks 12`, `--lr 5e-5` | Cuántos bloques se liberan y con qué tasa de aprendizaje |
+| `--patience 6` | Épocas sin mejorar antes de parar (6 por defecto desde el 13-nov-2026; las corridas del 12-nov usaron 4) |
+| `--dropout 0.5`, `--weight-decay 0.01` | Más regularización contra el sobreajuste (por defecto 0,2 y 0,0001) |
 | `--no-pretrained` | Solo para comparar: parte de pesos al azar, sin transferencia de aprendizaje |
 
 ### `32_audit_run.py` — ¿el modelo mira el documento o la cámara? (fase 3)
@@ -371,6 +377,101 @@ queda con el promedio, que no se entrena. Muestra cuánto se solapan las dos car
 combinado por parte, canal y origen, y el clasificador junto con las reglas (se marca a una
 persona si el puntaje pasa el umbral o si alguna regla falló). Lo deja en `runs/<name>/`
 (`combined` si no se da `--name`), que también se puede revisar con `32_audit_run.py`.
+
+### `34_plot_history.py` — curvas de entrenamiento (fase 3)
+No se conecta a nada. Dibuja, para cada parte de una corrida, la pérdida de entrenamiento contra
+la de validación por época, y marca la época cuyos pesos se conservaron:
+
+```powershell
+python scripts/34_plot_history.py runs/<corrida>
+python scripts/34_plot_history.py runs/<corrida> --metric accuracy
+```
+
+Deja `curves_loss.png` o `curves_accuracy.png` en la carpeta de la corrida. Solo sirve para
+corridas hechas desde el 13-nov-2026, que son las que guardan la pérdida de validación.
+
+**Positivos que no se usan.** Si en `data/<STAGE>/review/modalities.csv` hay positivos que la
+revisión visual marcó como documento auténtico (cédula real robada), `31_train.py` no los usa
+para entrenar, validar ni puntuar, y lo dice al empezar. El modelo busca falsificaciones y esas
+fotos no lo son.
+
+**Modelo final.** Con `--final` entrena la red para clientes nuevos: usa a todas las personas, sin
+apartar ninguna parte, y un número fijo de épocas que toma de una corrida de validación cruzada
+de la misma receta (la mediana de las épocas que conservaron sus cinco partes). Deja `final.pt`.
+Ese modelo no tiene resultado propio: el esperado es el de la validación cruzada.
+
+```powershell
+python scripts/31_train.py --side front --arch efficientnet_b0 --final --epochs-from runs/front_efficientnet_p6 --name front_efficientnet_final
+python scripts/31_train.py --side back --arch efficientnet_b0 --final --epochs-from runs/back_efficientnet_p6 --name back_efficientnet_final
+```
+
+### `50_calibrate.py` — calibración e indicador (fase 5)
+No se conecta a nada. Lee los puntajes de la validación cruzada de una corrida del frente y una
+del reverso, el manifest y el resultado de las reglas:
+
+```powershell
+python scripts/50_calibrate.py --front runs/front_efficientnet_p6 --back runs/back_efficientnet_p6
+```
+
+- Le da a cada negativo con fotos el peso de los negativos que representa (por canal y mes), para
+  que las cifras hablen de la población con etiqueta y no de la muestra de entrenamiento.
+- Calibra el promedio de los dos puntajes a una probabilidad de falsificación (compara Platt e
+  isotónica; usa la isotónica).
+- Mide el peso de cada regla: cuánto multiplica un FAIL las probabilidades a favor, tomando la
+  razón más baja que admiten los datos. Una regla sin fallos suficientes pesa 1.
+- Reporta si el indicador está calibrado y qué manda a revisión cada corte posible.
+
+Todo lo que reporta es anidado: lo que se aplica a una parte se ajustó sin ella. Deja en
+`runs/indicator/` los parámetros para clientes nuevos (`calibration.json`), una fila por persona
+(`indicator_oof.csv`) y las tablas de calibración y de cortes.
+
+### `35_grad_cam.py` — mapas de calor (fase 3)
+No se conecta a nada. Para cada persona usa el modelo de la parte que no la vio y calcula con
+Grad-CAM qué zonas de la foto empujaron el puntaje hacia "falsa":
+
+```powershell
+python scripts/35_grad_cam.py runs/<corrida de una cara>
+python scripts/35_grad_cam.py runs/<corrida de una cara> --queue runs/ensemble/missed_positives.csv
+```
+
+Deja dos cosas:
+
+- En `runs/<corrida>/`: `cam_mean.png` (el mapa promedio de cuatro grupos: positivos detectados,
+  positivos no detectados, negativos marcados y negativos no marcados) y `cam_summary.csv` (qué
+  parte del calor cae en el borde de la foto, donde hay fondo y no cédula). Son promedios de
+  muchas personas; no contienen fotos.
+- En `data/<STAGE>/cam/<corrida>/<grupo>/`: por persona, la foto junto a la misma foto con el
+  mapa encima. Son fotos de cédulas: quedan en `data/` y no se versionan. `--pictures` elige el
+  grupo (por defecto los positivos no detectados), `--queue` una lista y `--limit` cuántas.
+
+El mapa dice en qué zona se apoyó el modelo, no que esa zona esté falsificada.
+
+### `36_face_repeats.py` — caras repetidas (fase 3)
+No se conecta a nada. Revisa un riesgo de la validación cruzada: si la misma persona pone su cara
+en varias cédulas y una queda en entrenamiento y otra en prueba, el modelo del frente podría
+reconocer la cara en vez de la falsificación. Es una comprobación de la evaluación, no una parte
+del indicador.
+
+Lee la cara de cada foto del frente con dos modelos públicos de OpenCV (YuNet la encuentra, SFace
+la describe con 128 números) y compara todos los pares de personas. Los dos archivos van en
+`data/face_models/` y se bajan una sola vez de
+[opencv_zoo](https://github.com/opencv/opencv_zoo): `face_detection_yunet_2023mar.onnx` y
+`face_recognition_sface_2021dec.onnx`.
+
+```powershell
+python scripts/36_face_repeats.py --run runs/ensemble
+```
+
+Dos caras coinciden cuando su parecido supera un umbral; el umbral se elige para que dos
+personas distintas (dos negativos) coincidan por azar solo una vez cada 100.000 pares
+(`--chance`). Imprime solo conteos: caras encontradas por canal, coincidencias observadas contra
+las esperadas por azar, grupos de personas con la misma cara y, con `--run`, la detección de los
+positivos cuya cara estaba en el entrenamiento de su modelo contra la de los demás. El puntaje
+del reverso sirve de control: una cara no puede ayudar al modelo del reverso.
+
+Deja en `data/<STAGE>/faces/` (datos biométricos; nunca se versionan) las descripciones de las
+caras, `face_groups.csv` y, en `pairs/`, imágenes de pares de positivos que coinciden, para que
+una persona confirme que las coincidencias son reales.
 
 ### `17_data_summary.py` — cifras del dataset
 No se conecta a nada. Lee el manifest, los archivos de OCR, las fotos en disco y los resultados

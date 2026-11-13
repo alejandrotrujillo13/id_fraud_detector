@@ -11,9 +11,10 @@ from torchvision import models
 ARCHITECTURES = ("mobilenet_v3_large", "efficientnet_b0")
 
 
-def build(arch: str = "mobilenet_v3_large", pretrained: bool = True) -> nn.Module:
+def build(arch: str = "mobilenet_v3_large", pretrained: bool = True, dropout: float | None = None) -> nn.Module:
     """Model with a single logit (forged vs genuine). `pretrained` downloads the ImageNet
-    weights the first time (public file, nothing is uploaded)."""
+    weights the first time (public file, nothing is uploaded). `dropout` replaces the rate of
+    the dropout layer before the output (both networks come with 0.2)."""
     if arch == "mobilenet_v3_large":
         model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2 if pretrained else None)
     elif arch == "efficientnet_b0":
@@ -22,6 +23,10 @@ def build(arch: str = "mobilenet_v3_large", pretrained: bool = True) -> nn.Modul
         raise ValueError(f"unknown architecture '{arch}' (choose one of {ARCHITECTURES})")
     last = model.classifier[-1]
     model.classifier[-1] = nn.Linear(last.in_features, 1)
+    if dropout is not None:
+        for layer in model.classifier:
+            if isinstance(layer, nn.Dropout):
+                layer.p = dropout
     return model
 
 

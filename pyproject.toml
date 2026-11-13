@@ -27,7 +27,7 @@ review = ["streamlit>=1.35"]
 # support (the default index only has the CPU build for Windows):
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 #   pip install -e ".[review,train]"
-train = ["torch>=2.6", "torchvision>=0.21"]
+train = ["torch>=2.6", "torchvision>=0.21", "matplotlib>=3.8"]
 # The `serve` group is added when phase 6 starts.
 
 [tool.setuptools.packages.find]

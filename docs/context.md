@@ -1180,3 +1180,404 @@ defecto de `31_train.py` y de `TrainConfig`, también para las corridas sin tran
 6). Las diez corridas del 12 y 13-nov-2026 (incluida `runs/ensemble`) se hicieron con 4, o con 6
 las dos sin transferencia; cada `config.json` guarda la que usó. Las corridas nuevas no se
 comparan directamente con esas: la diferencia mezcla la paciencia con el azar de la GPU.
+
+## 23. Curvas de pérdida y prueba de la paciencia (13-nov-2026)
+
+Alejandro repitió EfficientNet-B0 con las mediciones nuevas: el frente con paciencia 4 (arrancó
+antes del cambio) en `runs/front_efficientnet_b0_curves`, y el reverso con paciencia 8 en
+`runs/back_efficientnet_b0_curves`. `scripts/34_plot_history.py` (nuevo) dibuja las curvas y las
+deja en `curves_loss.png` y `curves_accuracy.png` de cada corrida; `matplotlib` quedó en el grupo
+`train` de `pyproject.toml`.
+
+**Lo que muestran las curvas.**
+
+- En las diez partes hay sobreajuste: la pérdida de entrenamiento baja hasta 0,01–0,09 y la de
+  validación toca su mínimo entre las épocas 4 y 8 (contando las 3 de la capa final) y después
+  sube, hasta más del doble en varias partes.
+- La época que se conserva (mejor PR-AUC de validación) casi siempre queda después del mínimo de
+  la pérdida de validación, a veces muy después (reverso, parte 1: época 20, pérdida 1,24 contra
+  un mínimo de 0,70). El orden de los puntajes sigue mejorando mientras los puntajes se vuelven
+  demasiado seguros. No afecta la detección al 2 %, que solo depende del orden, pero confirma que
+  los puntajes no sirven como probabilidad sin la calibración de la fase 5.
+- El frente reprodujo la corrida de ayer (78,8 %): agregar las mediciones no cambió el
+  entrenamiento.
+
+**Paciencia 8 contra 4 (solo el reverso de EfficientNet-B0, una corrida):** 71,7 % contra 68,5 %,
+3,2 puntos más (intervalo por remuestreo: de 0,5 a 4,6). Cambiaron tres partes; la mejora viene
+casi toda de la parte 1 (de 71 % a 84 %), donde el mejor PR-AUC de validación apareció en la
+época 17 del afinado. Claude había dicho que no esperaba mejora; en el reverso sí la hubo. Con
+una corrida no alcanza para darla por firme, y el frente no se ha probado con 8.
+
+**Pendiente de decidir por Alejandro:** si se repiten las cuatro variantes preentrenadas con
+paciencia 8 para rehacer el promedio. `runs/ensemble` (87 %) sigue hecho con paciencia 4.
+
+**Modelo final (preferencia de Alejandro, 13-nov-2026).** Cada corrida deja cinco modelos, uno
+por parte; sirven para medir la receta, no son el modelo que se usaría con clientes nuevos.
+Alejandro prefiere entrenar un modelo final con todos los datos, una vez que la validación
+cruzada dé un resultado aceptable y la receta quede fija. Queda para la fase 5. Puntos a
+resolver en ese momento: cuántas épocas entrenar sin parte de validación (la mediana de las
+mejores épocas de la validación cruzada), que la calibración y el umbral salen de los puntajes
+de la validación cruzada y no del modelo final, y que el backtest no puede hacerse sobre
+personas con las que el modelo final entrenó.
+
+## 24. Revisión visual de los no detectados (13-nov-2026)
+
+Alejandro revisó en la app los 54 positivos que el promedio de las cuatro variantes no detecta
+(`runs/ensemble/missed_positives.csv`). Preguntó si hacía falta el motivo; se le dijo que no,
+que bastaba con decir si la cédula se ve auténtica o falsificada. Resultado
+(`data/live/review/modalities.csv`, 60 respuestas con las 6 de antes):
+
+- **48 se ven falsificadas** (41 `FRAUD`, 6 de la tienda 623, 1 de AMORETT; 39 de comercio y 9
+  de app; 11 con fotos de hasta 700 px). Las 4 que fallan alguna regla están aquí.
+- **3 se ven auténticas:** las tres son `FRAUD` de comercio registrados en 2025.
+- **3 sin poder decidir.**
+
+**Lectura.** La hipótesis de que buena parte de los no detectados fueran documentos auténticos con
+el fraude en otra parte no se cumplió: son 3 de 54. Claude había señalado como candidatos a los
+21 con puntaje casi cero en las dos caras; la mayoría también se ven falsificados. Entonces el
+tope del modelo no está en las etiquetas: hay 48 falsificaciones que una persona reconoce y el
+modelo no. No quedó registrado qué las delata, porque no se marcó el tipo ni se escribieron
+notas.
+
+**Reservas.** La revisión no fue a ciegas (todos los casos mostrados estaban marcados como
+fraude) y solo cubre a los no detectados, así que no sirve para corregir la cifra principal: se
+sigue reportando 356 de 410. Sin las 3 auténticas sería 356 de 407 (87,5 %).
+
+**Pendiente de decidir por Alejandro:** si las 3 que se ven auténticas salen de los positivos al
+entrenar el modelo final. Son muy pocas para repetir la validación cruzada solo por eso.
+
+**Qué delata a las 48 (dicho por Alejandro, 13-nov-2026; sin conteo por tipo):**
+
+1. Impresiones en papel.
+2. Láminas reemplazadas con datos nuevos: la cédula se ve vieja o borrada de fondo, pero los
+   datos se ven muy claros y negros.
+3. Fotos borrosas a propósito. Se sabe que son fraude porque el equipo reconoce por la foto a
+   personas que lo intentan con frecuencia.
+4. Foto o datos reemplazados: borroso detrás de los datos para tapar los anteriores, y el marco
+   de la foto con inconsistencias.
+
+**Dos comprobaciones de Claude sobre archivos locales (solo conteos):**
+
+- *¿El texto le llega muy pequeño al modelo?* Con las cajas de texto que Rekognition ya había
+  devuelto: una línea de texto mide en mediana 37 px en la foto original del frente, 14 px en la
+  entrada de 512×320 y 22 px en la de 768×480; recortando por las cajas de texto llegaría a 30 px
+  (reverso: 32, 12, 18 y 21 px). La ganancia de recortar es pequeña frente a la entrada grande,
+  que ya se probó sin mejora. Además el recorte abriría un atajo: hay tres o más líneas legibles
+  en el reverso del 98,5 % de los positivos y solo del 88 % de los negativos. **No se recomienda
+  recortar por las cajas de texto.**
+- *¿Los no detectados son las fotos borrosas?* No. Midiendo la nitidez de la foto reducida, solo
+  2 de las 48 están entre las más borrosas (el 10 % menos nítido de los negativos), y en ese
+  grupo el modelo detecta 19 de 21 positivos. La medida es gruesa (la reducción esconde parte del
+  desenfoque), pero no señala la nitidez como la causa.
+
+**Lectura.** Los fallos son de cuatro tipos distintos, cada uno con pocos ejemplos; no hay una
+causa única que un ajuste resuelva. Dos puntos para el informe: el tipo 3 no es detectable por la
+foto del documento (el indicio es la cara de una persona conocida, no la cédula), y el producto
+debería tratar una foto ilegible como "no evaluable" y no como legítima. Riesgo anotado: si una
+misma persona aparece con varias identidades en partes distintas de la validación cruzada, el
+modelo del frente puede estar reconociendo la cara, y eso inflaría su resultado. La partición
+agrupa por red y por reverso compartido, no por cara. No se ha medido.
+
+## 25. Mapas de calor y regularización (13-nov-2026)
+
+**Grad-CAM.** `src/id_fraud_detector/model/cam.py` y `scripts/35_grad_cam.py` (nuevos). Para cada
+persona se usa el modelo de la parte que no la vio. Corrido sobre EfficientNet-B0 del frente y
+del reverso (las corridas que están en el promedio). Claude solo miró los mapas promedio por
+grupo (`runs/<corrida>/cam_mean.png`), que no contienen fotos; las imágenes por persona de los 54
+no detectados quedaron en `data/live/cam/<corrida>/missed_positives/` para que las vea Alejandro.
+
+Parte del calor que cae en el borde de la foto (un calor repartido por igual daría 0,40):
+
+| Grupo | Frente | Reverso |
+|---|---|---|
+| Positivos detectados | 0,14 | 0,30 |
+| Positivos no detectados | 0,37 | 0,41 |
+| Negativos marcados | 0,21 | 0,33 |
+| Negativos no marcados | 0,46 | 0,48 |
+
+- **Frente:** cuando el modelo marca a alguien (positivo o negativo), el calor es una sola mancha
+  en el centro-derecha de la foto, donde va la foto de la persona en la cédula. Cuando no marca,
+  el calor es difuso y evita esa zona.
+- **Reverso:** el calor de los detectados se reparte en cuatro o cinco zonas de la cédula
+  (centro, parte superior izquierda y las dos esquinas inferiores).
+- **Ninguno de los dos se apoya en el fondo.** Es otra evidencia, además de la revisión de cámara
+  y fecha, de que el modelo mira el documento.
+
+**Riesgo abierto del frente.** Que se apoye en la foto de la persona admite dos lecturas: que
+detecta la foto pegada o reemplazada (lo que Alejandro describió en los tipos 2 y 4), o que
+reconoce caras que se repiten. A favor de la primera: de las 100 personas de la red tienda 623 +
+AMORETT, que ningún modelo vio al entrenar, el frente solo detecta 85. No lo descarta para el
+resto de los positivos. Sigue pendiente que Alejandro diga si las mismas personas aparecen en
+muchos fraudes.
+
+**Límite del método.** El mapa se escala por su propio máximo, así que muestra dónde miró el
+modelo y no con cuánta fuerza; en una foto con puntaje casi cero el mapa no significa mucho. El
+puntaje recalculado difiere hasta 0,02 del guardado, porque aquí no se usa precisión mixta.
+
+**Sobreajuste.** Alejandro preguntó cómo mejorar la red para evitarlo antes de repetir con
+paciencia 8. `31_train.py` ganó `--dropout` y `--weight-decay` (probados en una corrida corta);
+las opciones `--blocks` y `--lr` ya existían. Propuesta de Claude: un solo experimento decidido
+de antemano con más regularización (decaimiento de pesos 0,01, dropout 0,5 y 3 bloques liberados
+en vez de 6) sobre EfficientNet-B0, las dos caras, comparado con la misma red y paciencia.
+Ninguno se ha corrido.
+
+**Paciencia 6 (decisión de Alejandro, 13-nov-2026).** Para el experimento de regularización
+prefirió 6 en vez de 8; quedó como valor por defecto de `31_train.py` y `TrainConfig`. No hay
+corrida de referencia de EfficientNet-B0 con paciencia 6 (el frente existe con 4; el reverso con
+4 y con 8), así que el experimento son cuatro corridas: la receta actual y la regularizada
+(`--weight-decay 0.01 --dropout 0.5 --blocks 3`), cada una para frente y reverso.
+
+## 26. Experimento de regularización y lectura de la paciencia (13-nov-2026)
+
+Alejandro corrió las cuatro corridas de EfficientNet-B0 con paciencia 6: `runs/front_efficientnet_p6`
+y `runs/back_efficientnet_p6` (receta actual) y `runs/front_efficientnet_p6_reg` y
+`runs/back_efficientnet_p6_reg` (decaimiento de pesos 0,01, dropout 0,5 y 3 bloques liberados).
+Detección con 2 % de falsos positivos, sobre los 410 positivos:
+
+| | Receta actual | Regularizada | Diferencia [IC 95 %] |
+|---|---|---|---|
+| Frente | 79,0 % (324) | 75,9 % (311) | −3,2 [−7,1; +0,7] |
+| Reverso | 68,5 % (281) | 62,7 % (257) | −5,9 [−10,3; −1,0] |
+| Promedio de las dos caras | 86,1 % (353) | 82,4 % (338) | −3,7 [−6,1; −0,5] |
+| Red nunca vista (100) | 94 | 84 | |
+| Resto de positivos (310) | 259 | 254 | |
+
+**La regularización empeoró el resultado y no quitó el sobreajuste.** Con la receta regularizada
+la pérdida de entrenamiento también baja a 0,03–0,09 y la de validación tiene su mínimo en las
+épocas 5 a 8 y después sube, igual que antes. Lo único que mejora es la pérdida de validación del
+reverso en la época conservada (0,86 contra 1,07): el modelo queda menos seguro de más, pero
+ordena peor. La mayor caída está en la red que el modelo nunca vio (94 a 84 de 100). Los tres
+cambios se probaron juntos, así que no se sabe cuál de ellos hace daño; no se van a separar
+(sería búsqueda de hiperparámetros sobre la misma validación cruzada). **Se queda la receta
+actual.** El sobreajuste lo controla la parada temprana; el exceso de confianza del puntaje se
+corrige en la calibración de la fase 5.
+
+**Lo que mostraron las corridas sobre la paciencia.** Con la misma semilla el entrenamiento sigue
+el mismo camino, así que cambiar la paciencia solo cambia dónde se corta:
+
+- Reverso, paciencia 6 contra 4: se conserva la misma época en las cinco partes; el resultado es
+  idéntico (281 de 410).
+- Frente, paciencia 6 contra 4: cambia la época en dos partes (19 en vez de 8; 21 en vez de 13);
+  324 contra 323.
+- Reverso, paciencia 8: la mejora de 3,2 puntos medida en §23 viene del modelo de una sola parte
+  (la 1, que siguió hasta la época 20 en vez de quedarse en la 11). No es evidencia de que más
+  paciencia sea mejor en general.
+- Las dos caras de EfficientNet-B0: 355 con paciencia 4 y 353 con paciencia 6 (−0,5 [−1,5; +1,7]).
+
+Recomendación de Claude: dejar la paciencia en 6 y **no rehacer el promedio de las cuatro
+variantes**; `runs/ensemble` (paciencia 4, 356 de 410) sigue siendo el resultado de la validación
+cruzada. Para el modelo final la paciencia no se usa: se entrena un número fijo de épocas. Con
+esto la receta queda fija y lo que sigue es la fase 5.
+
+## 27. Formas de combinar frente y reverso, y caras repetidas (13-nov-2026)
+
+**Caras repetidas.** Alejandro respondió la pregunta que estaba abierta desde §24: una misma
+persona puede aparecer en varios fraudes, pero no sabe cuántas veces pasa. El riesgo queda sin
+medir: si la misma cara está en la parte de entrenamiento y en la de prueba, el modelo del
+frente puede reconocer la cara en vez de la falsificación y la detección medida queda inflada
+para esas personas. Lo único medido a favor es la red tienda 623 + AMORETT (100 personas, todas
+en una parte): el frente detecta 85 a 89 sin haber visto a ninguna.
+
+**¿Un modelo de ensamble sobre los dos puntajes?** Alejandro preguntó si convenía un modelo que
+combine los resultados del frente y del reverso. Se midió sin entrenar nada, con los puntajes
+guardados de `runs/ensemble` y de EfficientNet-B0 con paciencia 6. Lo que tiene pesos ajustados
+se ajustó con cuatro partes y se aplicó a la quinta. Detección con 2 % de falsos positivos:
+
+| Forma de combinar | Cuatro variantes | EfficientNet-B0 sola |
+|---|---|---|
+| Promedio simple (lo que se usa) | 86,8 % (356) | 86,1 % (353) |
+| Máximo de los dos | 84,9 % (348) | 84,1 % (345) |
+| Promedio con pesos ajustados | 86,6 % (355) | 82,2 % (337) |
+| Regresión logística sobre los dos puntajes | 87,1 % (357) | 84,9 % (348) |
+| Regresión logística sobre los logits | 86,1 % (353) | 86,3 % (354) |
+| Promedio de los logits | 86,3 % (354) | 87,3 % (358) |
+| Regresión logística con la regla como tercera entrada | 87,1 % (357) | 84,9 % (348) |
+
+Ninguna forma supera al promedio simple más allá del ruido (la mejor diferencia es +1,2
+[−0,5; +3,2]) y ninguna gana en las dos columnas a la vez. La regresión aprende pesos casi
+iguales para las dos caras (5,7–6,7 y 5,0–5,9), que es lo mismo que promediar. **Se queda el
+promedio simple.** Las dos caras sí se complementan: de los 410 positivos, 267 los marcan las dos,
+66 solo el frente, 27 solo el reverso y 50 ninguna; el promedio ya aprovecha eso.
+
+Otra lectura del mismo cálculo: EfficientNet-B0 más MobileNetV3 da 85,1 %, y agregar corridas
+hasta las cuatro lleva a 86,8 %. Promediar más corridas ayuda poco una vez está EfficientNet-B0.
+
+## 28. Caras repetidas: medición (13-nov-2026)
+
+Alejandro aprobó construir la comprobación. `src/id_fraud_detector/evaluation/faces.py` y
+`scripts/36_face_repeats.py` (nuevos) leen la cara de cada foto del frente con dos modelos
+públicos de OpenCV (YuNet y SFace, en `data/face_models/`; no agregan dependencias) y comparan
+todos los pares de personas. Todo corre en el equipo; Claude solo vio conteos. Las descripciones
+de las caras quedan en `data/live/faces/`.
+
+**Caras encontradas:** en 394 de los 410 positivos (96 %) y en 4.497 de los 5.297 negativos
+(85 %). En app: 100 % de los positivos y 84 % de los negativos.
+
+**Umbral.** Dos caras "coinciden" si su parecido supera un umbral. Como no hay pares que se sepa
+que son la misma persona, el umbral se fijó por el otro lado: que dos negativos (personas
+distintas) coincidan por azar una vez cada 100.000 pares (parecido 0,546). Coincidencias entre
+positivos contra las esperadas por azar:
+
+| Azar permitido | Parecido | Pares de positivos | Esperados por azar |
+|---|---|---|---|
+| 1 en 1.000.000 | 0,613 | 7 | 0,1 |
+| 1 en 100.000 | 0,546 | 9 | 0,8 |
+| 1 en 10.000 | 0,487 | 23 | 7,7 |
+| 1 en 1.000 | 0,421 | 101 | 77,4 |
+
+**Sí hay caras repetidas, pero son pocas.** Con el umbral de 1 en 100.000, 12 positivos comparten
+cara con otro positivo, todos de origen `FRAUD`; 7 con uno de otra parte y 5 con uno que estaba
+en el entrenamiento de su propio modelo. Con el umbral de 1 en 10.000 son 20 con uno del
+entrenamiento, de los que 9 se esperan por azar. Con umbrales más flojos ya no hay más
+coincidencias que las del azar. Queda entre 5 y 11 positivos de 410 (1 a 3 %) cuya cara pudo
+verse en el entrenamiento. **En la red tienda 623 + AMORETT no hay ninguna cara repetida**: la
+red repite reversos, no caras.
+
+**No se detectan mejor.** Con `runs/ensemble`, de los 5 positivos cuya cara estaba en el
+entrenamiento el frente detecta 4 (80 %); de los 382 sin cara repetida, el 83 %. Con el umbral de
+1 en 10.000: 85 % contra 83 % en el frente, y la misma diferencia en el reverso (75 % contra
+73 %), que no puede usar la cara. Al ordenar los positivos por el parecido de su cara con la más
+parecida del entrenamiento, la detección del frente sube poco (81 % a 88 % del cuarto más bajo
+al más alto, sin la red) y la del reverso sube más (64 % a 77 %): es calidad de la foto, no
+memoria de caras. Sin los 5 positivos, la detección queda en 86,9 %.
+
+**Conclusión.** El 87 % no está inflado por caras repetidas en una cantidad que se pueda medir;
+en el peor caso (que esos 5 a 11 se detectaran solo por la cara) serían 1 a 3 puntos. No se
+rehace la partición. Límite: no se midió cuántas caras repetidas se le escapan al comparador
+(las caras de las cédulas son pequeñas y las fotos, de mala calidad). Las 9 parejas están en
+`data/live/faces/pairs/` para que Alejandro confirme que son la misma persona.
+`face_groups.csv` no sirve tal cual para agrupar la partición: entre los negativos trae unas 100
+parejas que coinciden por azar.
+
+**Hallazgo aparte.** El detector encuentra la cara más a menudo y con más confianza en los
+positivos: la confianza del detector, sola, separa positivos de negativos con ROC-AUC 0,70. Va
+en la misma dirección que Grad-CAM (el frente mira la foto de la persona) y que lo que Alejandro
+describió (foto reemplazada o impresa, que se ve más nítida que la de una cédula auténtica). En
+los 16 positivos sin cara encontrada el frente detecta 5.
+
+## 29. Modelo final: EfficientNet-B0, una red por cara (13-nov-2026)
+
+Alejandro preguntó qué significaba elegir entre "cuatro variantes" y "solo EfficientNet-B0", y
+si varias redes harían lenta la evaluación, porque al final esto corre como API. Tiempo de una
+predicción medido en su equipo, en CPU con un hilo y una imagen sintética: EfficientNet-B0
+143 ms; MobileNetV3 67 ms a 512×320 y 158 ms a 768×480; el mapa de calor de EfficientNet-B0,
+153 ms con la predicción incluida. Por cliente (frente y reverso): 0,3 s con dos redes y 0,9 s
+con seis u ocho. Cada red pesa 16 MB. En Lambda no se ha medido; Claude estima 2 a 3 veces más.
+
+**Decisión de Alejandro ("por ahora"):** el modelo final es EfficientNet-B0 sola, una red por
+cara, con promedio simple de frente y reverso. Quedó como decisión 7 en `docs/plan.md` §0. No
+se midió el promedio de EfficientNet-B0 con varias semillas (4 a 6 redes); queda como opción si
+una sola red resulta inestable. La cifra de validación cruzada de este modelo es 86,1 %
+(paciencia 6) a 86,6 % (paciencia 4); el 86,8 % de `runs/ensemble` es de las cuatro variantes.
+
+## 30. Las tres cédulas auténticas: robadas, no falsificadas (13-nov-2026)
+
+Alejandro explicó por qué las 3 cédulas que vio auténticas en la revisión (§24) están marcadas
+como `FRAUD`: la selfie que se tomó el cliente no coincidía con la foto de la cédula. Son
+documentos auténticos usados por otra persona. Su razonamiento: este modelo es para
+falsificaciones, así que esas fotos no son ejemplos de lo que busca; el fraude lo deben alertar
+las demás verificaciones cuando el indicador se combine con ellas. Propuso usarlas como
+negativos y dejó a criterio de Claude excluirlas.
+
+**Quedan excluidas** (decisión 8 de `docs/plan.md` §0). Con los puntajes que ya existen da lo
+mismo excluirlas que pasarlas a negativos, y excluirlas mantiene una sola definición de negativo
+(crédito pagado y sin marca) en vez de mezclar tres casos decididos a ojo:
+
+| Modelo | Como están en la base | Excluidas | Como negativos |
+|---|---|---|---|
+| EfficientNet-B0, paciencia 6 (modelo final) | 353 de 410 (86,1 %) | 353 de 407 (86,7 %) | 353 de 407 (86,7 %) |
+| EfficientNet-B0, paciencia 4 | 355 de 410 (86,6 %) | 355 de 407 (87,2 %) | 355 de 407 (87,2 %) |
+| Promedio de cuatro variantes | 356 de 410 (86,8 %) | 356 de 407 (87,5 %) | 356 de 407 (87,5 %) |
+
+Ningún modelo marcaba a las tres. `model/data.excluded_by_review` lee las respuestas de la
+revisión y `31_train.py` deja a esas personas fuera del entrenamiento, de la validación y de
+los puntajes, sin tocar la caché de fotos. No se volvió a entrenar nada: las corridas
+existentes las tienen como positivos y basta quitarlas al calcular.
+
+**Reserva que sigue en pie.** Solo se revisaron los 54 positivos no detectados. Entre los 353
+detectados puede haber más cédulas auténticas robadas que el modelo marca; contarían como
+aciertos sin serlo. Para saberlo habría que conocer el motivo de cada `FRAUD`.
+
+**Respuesta de Alejandro sobre el motivo (13-nov-2026).** La base no distingue los casos: no hay
+un campo que diga si un `FRAUD` fue por cédula falsificada o por cédula auténtica robada. La
+reserva queda como limitación del proyecto. Como propuesta de mejora, Alejandro plantea mejorar
+la captura de las fotos y registrar el motivo del fraude o de la falsificación, para reentrenar
+un modelo mejor más adelante. Quedó en `docs/plan.md` §8.1 con las cifras medidas que respaldan
+cada propuesta.
+
+## 31. Fase 5: calibración del indicador (13-nov-2026)
+
+Alejandro preguntó qué es calibrar y si no hacía falta primero el modelo final. No: el modelo
+final ve a todas las personas y no deja puntajes limpios; se calibra con los de la validación
+cruzada y la función se le aplica después. Supuesto: el modelo final se comporta como los cinco
+de la validación cruzada.
+
+Existen `src/id_fraud_detector/risk.py` (calibración de Platt e isotónica, peso de las reglas,
+indicador), `evaluation/population.py` (pesos de muestreo) y `scripts/50_calibrate.py`. Corrido
+sobre `runs/front_efficientnet_p6` y `runs/back_efficientnet_p6`; resultado en `runs/indicator/`.
+Todo lo que sigue es "anidado": la calibración y los pesos que se aplican a una parte se
+ajustaron sin ella.
+
+**Población.** Las 5.704 personas con fotos (407 positivos; 3 excluidos por la revisión)
+representan a 28.290 personas con etiqueta: cada negativo pesa lo que representa su celda de
+canal y mes (entre 1 y 7,3). Las cédulas falsas son el 1,44 % de esa población y el 7,14 % de la
+muestra. El 2 % de falsos positivos medido en la muestra es 1,98 % en la población: la muestra
+emparejada no distorsiona esa cifra.
+
+**Método.** Pérdida logarítmica ponderada (menor es mejor): decir siempre 1,44 %, 0,0753; el
+puntaje crudo, 0,0610; Platt, 0,0287; isotónica, 0,0264. Se usa la **isotónica**: el promedio de
+dos redes que casi siempre dicen 0 o 1 se amontona en 0, 0,5 y 1, y la probabilidad salta de 5 %
+a 25 % justo al pasar de 0,50 a 0,52 (una cara dice "falsa" y la otra empieza a dudar). Una
+curva logística no puede seguir ese salto; Platt quedaba mal en la mitad de la escala (12 de
+indicador contra 26 falsas por cada 100).
+
+**¿Los cinco modelos se calibran igual?** Cuatro sí (un puntaje de 0,9 equivale a 62–71 % de
+probabilidad); el de la parte 4 no (26 %). El supuesto de que la calibración se traslada al
+modelo final es aproximado; habrá que recalibrar con los casos que acumule el modo SHADOW.
+
+**Peso de las reglas.** Un FAIL multiplica las probabilidades a favor (odds) por el peso de la
+regla. El peso es la razón más baja que admiten los datos: límite inferior (Wilson, 95 %) de la
+tasa de fallo entre falsas dividido por el límite superior entre auténticas, nunca menor que 1.
+
+| Regla | Falsas: fallan / evaluadas | Auténticas: fallan / evaluadas | Peso |
+|---|---|---|---|
+| `R_REPEATED_BACK` | 37 / 137 | 0 / 990 | 78,0 |
+| `R_REGISTRAR` | 19 / 142 | 1 / 1.330 | 27,8 |
+| `R_PRODUCTION` | 2 / 126 | 0 / 929 | 1,8 |
+| Las demás | 0 | 0 | 1 (no cambian nada) |
+
+Medidos sin la parte 0 (donde está la red), los pesos bajan a 28,1 y 1,9: la mayoría de los
+fallos son de la red. Las reglas solas llevan a revisión a 3 positivos más y a ningún negativo.
+
+**Cortes posibles** (indicador = probabilidad calibrada × 100, con reglas):
+
+| Legítimos por encima | Indicador | Falsas por encima | Falsas por cada 100 marcados |
+|---|---|---|---|
+| 2 % (107 de la muestra) | 3,1 | 352 de 407 (86,5 %) | 39 |
+| 1 % (54) | 11,6 | 343 (84,3 %) | 55 |
+| 0,5 % (23) | 40,9 | 280 (68,8 %) | 68 |
+| 0,2 % (9) | 52,2 | 250 (61,4 %) | 83 |
+| 0,1 % (4) | 67,3 | 221 (54,3 %) | 89 |
+| 0,02 % (1) | 78,7 | 200 (49,1 %) | 97 |
+
+Por canal con el corte del 2 %: app 119 de 128 y 1,94 % de legítimos; comercio 224 de 270 y
+1,94 %; WhatsApp 9 de 9 y 3,65 %.
+
+**Lo que hay que decidir.** Con el número como probabilidad, la revisión empezaría en 3, no en
+40 como decía el plan; y la proporción real de fraude entre los clientes nuevos no se conoce
+(1,44 % entre los que tienen etiqueta; cerca de 0,15 % si se cuenta a todos los registrados).
+
+**Explicaciones pedidas por Alejandro (13-nov-2026).** Las preguntas sobre la escala y los
+cortes no se entendieron a la primera; pidió varias aclaraciones: qué entrega el modelo (un
+número entre 0 y 1 por foto), qué devuelve el producto (franja, indicador, puntajes, reglas y
+mapas de calor), qué diferencia hay entre probabilidad calibrada e indicador (ninguna si el
+indicador es la probabilidad) y qué significa una probabilidad para un solo cliente. Claude
+cambió su recomendación: el indicador debe ser la probabilidad calibrada por 100, sin una
+segunda escala estirada a 40 y 70. Alejandro aún no eligió los cortes; quedan provisionales:
+revisión al 2 % de legítimos (probabilidad 0,03) y retención al 0,1 % (0,67).
+
+**Modo `--final` de `31_train.py`.** Entrena con todas las personas (sin las 3 excluidas), sin
+parte de validación, un número fijo de épocas: la mediana de las épocas conservadas por las
+cinco partes de la corrida de referencia. Para EfficientNet-B0 con paciencia 6 son 13 en las
+dos caras (3 de la capa final y 10 de ajuste; frente [7, 19, 8, 13, 21], reverso
+[12, 11, 23, 14, 13]). Probado con 300 personas; el modelo final completo no se ha entrenado.

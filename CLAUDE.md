@@ -138,15 +138,82 @@ los repositorios `mikro_back` y `mikro_front`; este proyecto es **independiente*
   diferencias entre corridas sueltas no prueban qué variante es mejor; la entrada grande no
   ayudó; sin transferencia queda en 17 %. `33_combine_sides.py` ahora recibe `--front` y
   `--back` con una o varias corridas.
-- **Pendiente de decidir por Alejandro:** si el modelo final es el promedio de las cuatro
-  variantes (ocho redes al puntuar) o solo EfficientNet-B0 (dos redes, 86,6 % en una sola
-  corrida). `docs/plan.md` no se ha cambiado por esto.
-- **Siguiente paso:** Alejandro revisa a ojo los 54 positivos que el promedio no detecta
-  (`streamlit run scripts/13_visual_review.py -- --queue runs/ensemble/missed_positives.csv`;
-  un clic por caso, con deshacer). Después: Grad-CAM (mapas de calor) y la fase 5: calibrar el
-  puntaje a 0–100 y el backtest. No hagas búsqueda amplia de hiperparámetros: con 410
+- **Curvas y paciencia (13-nov-2026, `docs/context.md` §23):** `history.csv` guarda ahora pérdida
+  y exactitud de entrenamiento y de validación; `scripts/34_plot_history.py` las dibuja. La
+  paciencia por defecto pasó de 4 a 8 y luego a 6 (pedidos de Alejandro; hoy es 6). Las curvas muestran sobreajuste
+  después de las épocas 4 a 8, controlado por la parada temprana. Con paciencia 8 el reverso de
+  EfficientNet-B0 dio 71,7 % contra 68,5 % (una corrida); el frente no se ha probado con 8, y
+  `runs/ensemble` sigue hecho con paciencia 4 (ver el experimento de regularización, más abajo).
+- **Grad-CAM (13-nov-2026, `docs/context.md` §25):** existe `model/cam.py` y
+  `scripts/35_grad_cam.py`; corrido sobre EfficientNet-B0 de frente y de reverso. En el frente,
+  cuando el modelo marca a alguien el calor está en la zona de la foto de la persona; en el
+  reverso se reparte en varias zonas de la cédula. En ningún caso mira el fondo. Riesgo abierto:
+  si el frente aprende la foto pegada o caras repetidas; se midió después (ver "Caras repetidas"). `31_train.py` tiene `--dropout` y
+  `--weight-decay`.
+- **Experimento de regularización (corrido el 13-nov-2026, `docs/context.md` §26):** EfficientNet-B0
+  con paciencia 6, receta actual contra regularizada (`--weight-decay 0.01 --dropout 0.5
+  --blocks 3`). La regularizada es peor: las dos caras detectan 82,4 % contra 86,1 % (−3,7
+  [−6,1; −0,5]) y la red nunca vista baja de 94 a 84 de 100; la pérdida de validación sigue
+  subiendo igual. **Se queda la receta actual; no pruebes más variantes de regularización.**
+  Paciencia: con la misma semilla solo cambia dónde se corta; 6 contra 4 da lo mismo (353 contra
+  355 en las dos caras) y la mejora del reverso con 8 venía del modelo de una sola parte.
+  Recomendación de Claude, pendiente de que Alejandro la confirme: no rehacer `runs/ensemble`.
+- **Combinar frente y reverso (13-nov-2026, `docs/context.md` §27):** se midieron máximo, pesos
+  ajustados y regresión logística sobre los dos puntajes; ninguno supera al promedio simple más
+  allá del ruido. Se queda el promedio simple; no propongas un modelo de fusión.
+- **Caras repetidas (13-nov-2026, `docs/context.md` §28):** existe `evaluation/faces.py` y
+  `scripts/36_face_repeats.py` (modelos públicos YuNet y SFace de OpenCV en `data/face_models/`,
+  todo local). Alejandro dijo que una persona puede aparecer en varios fraudes; medido: 12
+  positivos comparten cara con otro positivo y solo 5 la tenían en el entrenamiento de su modelo
+  (entre 5 y 11 según el umbral); la red tienda 623 + AMORETT no repite caras. No se detectan
+  mejor que los demás (4 de 5 contra 83 %). **El 87 % no está inflado por caras de forma medible
+  y la partición no se rehace.** Límite: no se sabe cuántas caras repetidas se le escapan al
+  comparador; las 9 parejas están en `data/live/faces/pairs/` para que Alejandro las confirme.
+  Es una comprobación de la evaluación, no una parte del indicador.
+- **Modelo final (preferencia de Alejandro, 13-nov-2026):** los cinco modelos de cada corrida
+  (`fold0.pt` a `fold4.pt`) solo miden la receta. El modelo para clientes nuevos se entrenará
+  con todos los datos, cuando la validación cruzada sea aceptable y la receta quede fija (fase
+  5; detalle al final de `docs/context.md` §23). No se ha entrenado.
+- **Modelo final: EfficientNet-B0, una red por cara (decisión de Alejandro, 13-nov-2026, "por
+  ahora"; `docs/plan.md` §0, decisión 7).** Dos redes al puntuar, promedio simple de frente y
+  reverso, receta actual. Razón: detecta lo mismo que el promedio de cuatro variantes (86,1 a
+  86,6 % contra 86,8 %) y como API es más simple y rápido (0,3 s por cliente en CPU contra
+  0,9 s, medido en el equipo de Alejandro). El promedio de EfficientNet-B0 con varias semillas
+  no se ha medido; no lo entrenes sin que él lo pida.
+- **Revisión visual hecha (13-nov-2026, `docs/context.md` §24):** de los 54 positivos que el
+  promedio no detecta, Alejandro ve 48 como falsificados, 3 como auténticos y 3 sin poder
+  decidir. Los fallos son del modelo, no de la etiqueta. No registró el tipo de falsificación
+  (no era necesario).
+- **Las 3 auténticas se excluyen (decisión de Alejandro, 13-nov-2026; `docs/plan.md` §0,
+  decisión 8):** son cédulas auténticas robadas (la selfie no coincidía con la foto del
+  documento), no falsificaciones. `model/data.excluded_by_review` las lee de
+  `data/<STAGE>/review/modalities.csv` y `31_train.py` no las usa para entrenar, validar ni
+  puntuar; no pasan a negativos. Las corridas anteriores las tienen como positivos: sin ellas
+  el modelo final detecta 353 de 407 (86,7 %) en vez de 353 de 410 (86,1 %). Calibración,
+  backtest y modelo final deben excluirlas igual. Solo se revisaron los no detectados, así que
+  puede haber más cédulas auténticas robadas entre los positivos detectados.
+- **Fase 5 empezada (13-nov-2026, `docs/context.md` §31):** existen `risk.py` (calibración,
+  peso de las reglas, indicador), `evaluation/population.py` (pesos de muestreo),
+  `scripts/50_calibrate.py` y el modo `--final` de `31_train.py`. Calibración isotónica sobre
+  `runs/front_efficientnet_p6` y `runs/back_efficientnet_p6`, en `runs/indicator/`. Las 5.704
+  personas con fotos representan a 28.290 con etiqueta (falsas: 1,44 %). Pesos de las reglas:
+  `R_REPEATED_BACK` 78, `R_REGISTRAR` 27,8, `R_PRODUCTION` 1,8; las demás 1. Cortes medidos:
+  2 % de legítimos ↔ probabilidad 0,03 ↔ 352 de 407 falsas; 0,1 % ↔ 0,67 ↔ 221. **Los cortes
+  y la forma del indicador no están decididos:** Alejandro pidió varias explicaciones y aún
+  no eligió. Valores provisionales: revisión al 2 % de legítimos (lo dice el plan), retención al
+  0,1 %, indicador = probabilidad × 100. Explícale con ejemplos de un solo cliente, no con
+  "grupos" ni jerga. **El modelo final no se ha entrenado** (los comandos están en el README).
+- **Motivo del fraude (Alejandro, 13-nov-2026):** la base no distingue cédula falsificada de
+  cédula auténtica robada, así que no se puede saber cuántas robadas hay entre los positivos
+  detectados; es una limitación que se reporta. Sus propuestas de mejora para la empresa
+  (mejor captura de fotos, registrar el motivo del fraude, reentrenar después) están en
+  `docs/plan.md` §8.1 y van en el informe como recomendaciones, no como trabajo de este proyecto.
+- **Siguiente paso:** que Alejandro entrene el modelo final (dos comandos) y confirme los
+  cortes; luego `pipeline.py` (una función: fotos y texto del reverso -> resultado) y el
+  backtest, que necesita los montos de los créditos (script nuevo de solo lectura que él corre). Sigue pendiente que Alejandro mire las 9
+  parejas de caras. No hagas búsqueda amplia de hiperparámetros: con 410
   positivos, probar muchas variantes sobre la misma validación cruzada infla el resultado.
-- **NO existe:** Grad-CAM, calibración a 0–100, backtest, ninguna integración con
+- **NO existe:** modelo final entrenado, `pipeline.py`, backtest, ninguna integración con
   `mikro_back`.
 
 ## Qué es la solución (resumen; detalle en docs/plan.md §3 y §4)
