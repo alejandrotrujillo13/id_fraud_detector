@@ -199,6 +199,33 @@ class Sampling(unittest.TestCase):
     def test_asking_for_more_than_available_returns_all(self):
         self.assertEqual(len(sample_negatives(self.df, 10_000, seed=1)), 600)
 
+    def test_new_customers_do_not_move_the_people_already_chosen(self):
+        first = sample_negatives(self.df, 120, seed=42)
+        more = [(None, True, date(2025, 1 + i % 12, 1), True) for i in range(660)]  # 60 new customers
+        grown = label_clients(clients(more), "esmio", CFG)
+        again = sample_negatives(grown, 120, seed=42)
+        self.assertGreaterEqual(len(first & again), 100)  # almost everybody stays; before, the draw started over
+        self.assertEqual(sample_negatives(grown, 120, seed=42, keep=first) & first, first)
+
+    def test_people_with_photos_on_disk_stay_and_count_toward_their_month(self):
+        january = set(self.df[pd.to_datetime(self.df["registered_date"]).dt.month == 1]["client_id"])
+        on_disk = set(sorted(january)[:25])  # more than the 10 that month would get
+        chosen = sample_negatives(self.df, 120, seed=42, keep=on_disk)
+        self.assertEqual(chosen & january, on_disk)  # nobody else of that month is added
+        self.assertEqual(len(chosen), 25 + 11 * 10)
+
+    def test_some_negatives_are_always_selected(self):
+        df = self.df.copy()
+        df.loc[df["client_id"] < 30, "channel"] = "COMMERCE"
+        df.loc[df["client_id"] >= 30, "channel"] = "WHATSAPP"
+        df.loc[df["client_id"] % 100 == 7, "channel"] = "APP"  # 6 people
+        always = {"channels": ["APP"], "registered_from": "2025-12-01"}  # December: 50 people
+        chosen = sample_negatives(df, 60, seed=42, always=always)
+        app = set(df[df["channel"] == "APP"]["client_id"])
+        december = set(df[pd.to_datetime(df["registered_date"]).dt.month == 12]["client_id"])
+        self.assertTrue(app <= chosen and december <= chosen)
+        self.assertLess(len(chosen), 60 + len(app | december) + 15)
+
 
 class OcrFile(unittest.TestCase):
     def test_exported_file_is_readable_by_the_parser(self):

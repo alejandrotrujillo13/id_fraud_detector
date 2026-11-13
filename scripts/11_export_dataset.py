@@ -149,10 +149,15 @@ def main():
     frames: dict[str, pd.DataFrame] = {}
     for tenant in tenants:
         df = people[people["tenant"] == tenant].copy()
-        with_images = set(df.loc[df["label"] == POSITIVE, "client_id"]) | \
-            sample_negatives(df, cfg["negatives_with_images"].get(tenant, 0), cfg["seed"])
+        # negatives whose photos are already on disk stay selected, so the sample never moves
+        on_disk = {r.client_id for r in df[df["label"] != POSITIVE].itertuples(index=False)
+                   if all(image_path(out, tenant, r.label, r.anon_id, side).exists() for side in SIDES)}
+        negatives = sample_negatives(df, cfg["negatives_with_images"].get(tenant, 0), cfg["seed"],
+                                     keep=on_disk, always=cfg.get("negatives_always_with_images"))
+        with_images = set(df.loc[df["label"] == POSITIVE, "client_id"]) | negatives
         df["has_images"] = df["client_id"].isin(with_images)
-        print(f"== {tenant}: {counts(df)}  selected for images={len(with_images)}")
+        print(f"== {tenant}: {counts(df)}  selected for images={len(with_images)}"
+              f"  (negatives: {len(negatives)}, of them already on disk: {len(on_disk)})")
         if len(df):
             with closing(pg_connection(tenant)) as con:
                 export_ocr(con, tenant, df, ocr_dir, args.refresh_ocr)

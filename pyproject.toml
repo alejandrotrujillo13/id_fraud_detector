@@ -23,7 +23,12 @@ dependencies = [
 [project.optional-dependencies]
 # Local review app (scripts/13_visual_review.py).
 review = ["streamlit>=1.35"]
-# The `train` and `serve` groups are added when phases 3 and 6 start.
+# Phase 3: the image classifier. Install PyTorch FIRST from its own index so it comes with GPU
+# support (the default index only has the CPU build for Windows):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#   pip install -e ".[review,train]"
+train = ["torch>=2.6", "torchvision>=0.21"]
+# The `serve` group is added when phase 6 starts.
 
 [tool.setuptools.packages.find]
 where = ["src"]

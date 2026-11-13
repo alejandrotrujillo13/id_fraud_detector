@@ -38,11 +38,19 @@ confirmed_fraud_sources:
 
 # Negatives (genuine ID): no fraud_status and at least one PAID credit.
 # Every negative goes into the manifest with metadata + OCR (to measure rule false positives);
-# only a stratified sample (by month and channel) is downloaded with images (to train the CNN).
+# only some are downloaded with images (to train the CNN):
+#   - a sample stratified by month and channel, of about this size per tenant;
+#   - every negative that already has its photos on disk (the sample never shrinks or moves);
+#   - every negative of `negatives_always_with_images`, so the negatives resemble the positives:
+#     31 % of the positives come from the app and 28 % registered since September 2026, against
+#     3.5 % and 1 % of the negatives (decision of 2026-11-12).
 negatives_with_images:
   esmio: 2500
   llevaloya: 1500
   demo: 200
+negatives_always_with_images:
+  channels: [APP]
+  registered_from: "2026-09-01"
 seed: 42
 
 output_dir: data

@@ -907,3 +907,276 @@ del 75 % del ancho de la foto, o sea que la cédula ya llena casi todo el cuadro
 2 "replaced_photo").
 
 **Gasto total en Rekognition:** 9,53 USD (9.334 fotos más 200 de la prueba de ampliación).
+
+## 17. Decisiones para el clasificador (12-nov-2026)
+
+Alejandro decidió que las 15 cédulas "falsas" del verificador sin registro de origen no entran
+(no se sabe quién las confirmó) y aceptó las cinco recomendaciones de Claude para seguir. Quedó
+todo en `docs/plan.md` §0.
+
+1. **Dónde se entrena: en su equipo.** NVIDIA RTX 2070 de 8 GB, 12 núcleos y 153 GB libres
+   (medido). Las fotos no salen de la máquina y no hay costo.
+   - **Marco: PyTorch**, no Keras/TensorFlow como en la materia. Motivo: TensorFlow dejó de usar
+     la tarjeta gráfica en Windows nativo (exige WSL2), y Grad-CAM, que es un entregable, es
+     directo en PyTorch. La receta es la misma del Taller 1: base preentrenada congelada, cabeza
+     nueva y luego afinar las últimas capas. Alejandro aceptó "instalar PyTorch"; conviene
+     recordárselo cuando vea el código, porque en clase vio Keras.
+2. **Negativos emparejados con los positivos.** La muestra proporcional se parecía a los
+   negativos (94 % comercio, 1 % registrado desde septiembre de 2026) y no a los positivos
+   (31 % app, 28 % desde septiembre de 2026). Ahora, además de la muestra por mes y canal,
+   entran todos los negativos de app (980) y todos los registrados desde el 1-sep-2026 (301):
+   `negatives_always_with_images` en `config.yaml`.
+   - **El sorteo quedó estable** (`dataset.sample_negatives`): quien ya tiene fotos en disco no
+     sale de la muestra y cuenta para la cuota de su mes y canal; lo que falte se toma en un
+     orden fijo que depende solo de la persona y de la semilla. Antes cada exportación volvía a
+     sortear y movió unos 240.
+   - Calculado con el manifest local: quedarían 5.297 negativos con fotos (3.497 de ESMIO y
+     1.800 de Llévalo Ya) y faltan por bajar las de 1.026 personas (824 de app), unas 2.052
+     fotos. Solo descarga; Rekognition es opcional (unos 2 USD si se quiere medir las reglas en
+     esos negativos).
+3. **Sin recorte en el primer modelo.** Foto completa reducida. Si queda corto, se compara
+   contra una versión recortada.
+4. **Evaluación: validación cruzada en cinco partes por persona**, con cada red completa
+   (tienda 623, AMORETT, y quienes comparten reverso) en una sola parte. Se descartó la
+   partición por tiempo y Llévalo Ya como prueba externa (20 positivos).
+5. **Papel de las reglas:** evidencia adicional; el clasificador es el componente principal.
+
+Alejandro quiere mantener al día la copia de `docs/plan.md` del proyecto de Claude.ai, por si
+arma la presentación desde allá: hay que avisarle cada vez que el plan cambie. Hizo commit de
+todo lo anterior el 12-nov-2026 (`53711e4`).
+
+## 18. Muestra emparejada en `live` e inicio de la fase 3 (12-nov-2026)
+
+**Exportación y lectura.** Alejandro corrió `11_export_dataset.py` con la muestra nueva:
+28.293 personas (410 positivos, 27.883 negativos), **5.297 negativos con fotos** (3.497 de ESMIO
+y 1.800 de Llévalo Ya), sin errores de descarga. Luego leyó con Rekognition a los 1.040 que
+faltaban (2,08 USD). Gasto total en Rekognition: **11,61 USD**. Hoy tienen fotos y texto nuevo
+las mismas 5.707 personas: 410 positivos y 5.297 negativos.
+
+**Reglas con más negativos de app** (980 en vez de 156): siguen sin fallar. 1 negativo con
+algún fallo entre 5.297 (el mismo de comercio, por `R_REGISTRAR`: 1 de 1.330 evaluables,
+0,08 %). Con alguna regla del código evaluable: 1.500 negativos (484 de app). Topes de falsos
+positivos de las reglas sin fallos: entre 0,08 % y 0,32 %. En negativos de app el código se lee
+en el 38 % y el registrador en el 69 %.
+
+**PyTorch** 2.14.1 con GPU quedó instalado en `.venv` y comprobado con la RTX 2070.
+
+**Código de la fase 3** (nuevo, en PyTorch):
+
+- `evaluation/splits.py` y `scripts/30_make_splits.py`: cinco partes por persona, redes y
+  reversos compartidos juntos, parejas en etiqueta y canal. Claude lo corrió (solo lee archivos
+  locales) y dejó `data/live/splits.csv`.
+- `evaluation/metrics.py`: PR-AUC, ROC-AUC y detección con un 2 % de falsos positivos, sin
+  scikit-learn.
+- `model/data.py`: reduce cada foto una vez a 512×320 (cubre el cuadro y corta el exceso por
+  igual a ambos lados; no agrega barras, porque delatarían la forma del cuadro de la cámara y
+  con ella el canal) y la guarda en `data/live/cache/`.
+- `model/net.py` y `model/train.py`: MobileNetV3 o EfficientNet-B0 de torchvision con una
+  salida; primero solo la cabeza, luego los últimos 6 bloques con tasa baja; pérdida con peso
+  para los positivos; parada temprana por PR-AUC de validación; aumento leve en la GPU.
+- `scripts/31_train.py`: por cada parte entrena con tres, valida con una y puntúa la quinta;
+  deja todo en `runs/<nombre>/`.
+
+Probado con una corrida corta de 400 personas y una parte en la GPU: corre de punta a punta.
+Velocidad medida: unas 465 fotos por segundo entrenando, o sea unos 7 segundos por época de
+3.400 fotos. La corrida completa de una cara debería tardar alrededor de 20 minutos, la mayor
+parte reduciendo las fotos la primera vez. **Ningún modelo completo se ha entrenado todavía.**
+
+**Hallazgo de la partición: la tienda 623 y AMORETT son una sola red.** Comparten reversos
+entre sí, así que quedaron en un solo grupo de 100 personas (79 + 17 + los 4 nuevos de
+Finandina), completo en la parte 0. Otros 11 positivos `FRAUD` comparten reverso en 5 grupos
+pequeños. Consecuencias para leer los resultados:
+
+- 100 de los 128 positivos de app son de esa red; fuera de ella hay 28 positivos de app (7 por
+  parte). La parte 0 tiene 133 positivos y las demás unos 69.
+- El resultado de la parte 0 responde "¿el modelo habría detectado una red que nunca vio?". El
+  de las otras cuatro mide la detección de los `FRAUD` sueltos, casi todos de comercio.
+- Cuando la parte 0 está en entrenamiento, la red pesa mucho (100 de unos 240 positivos). Hay
+  que mirar los resultados por origen, no solo el total.
+
+## 19. Primer modelo del reverso (12-nov-2026)
+
+Alejandro corrió `python scripts/31_train.py --side back` (MobileNetV3, 512×320, foto completa,
+cinco partes). Corrida `runs/back_mobilenet_v3_large_512x320_20261112_1952`. Cada puntaje lo da
+un modelo que no entrenó con esa persona ni con su red.
+
+**Resultado, 410 positivos y 5.297 negativos:**
+
+| | Valor |
+|---|---|
+| Detección dejando pasar a revisión al 2 % de las legítimas | **61,2 %** (251 de 410) |
+| PR-AUC | 0,71 |
+| ROC-AUC | 0,91 |
+
+Las reglas solas detectan el 12 %. Por parte: 65 %, 83 %, 62 %, 67 % y 67 % (cada parte con su
+propio umbral del 2 %). Entrenó entre 13 y 23 épocas por parte.
+
+**Por canal** (un solo umbral para todos): app 59 % (75 de 128), comercio 62 % (169 de 273),
+WhatsApp 7 de 9. Los falsos positivos quedan cerca del 2 % en app y en comercio, así que el
+umbral no castiga a un canal. Dentro de cada canal el modelo separa bien: ROC-AUC de 0,92 en
+app y 0,90 en comercio.
+
+**Por origen del positivo:** `FRAUD` 64 % (192 de 302); red de la tienda 623, 53 % (42 de 79);
+AMORETT 41 % (7 de 17); Finandina 3 de 4; verificador 7 de 8. La red (tienda 623 + AMORETT)
+estaba completa en la parte 0, o sea que el modelo que la puntuó nunca la había visto: detecta
+cerca de la mitad de una red nueva.
+
+**¿Aprendió la cámara o la fecha?** No, según la revisión de `scripts/32_audit_run.py`:
+
+- Un "modelo" que no mira la foto y solo conoce canal, tamaño de la foto y periodo de registro
+  llega a ROC-AUC 0,74 y detecta el 25 % al 2 %. Solo con canal y tamaño no detecta nada
+  (ROC-AUC por debajo de 0,5). El clasificador llega a 0,91 y 61 %.
+- Dentro de grupos donde canal, tamaño exacto de la foto y periodo son iguales para todos (337
+  de los 410 positivos caen en grupos con suficiente gente), el ROC-AUC ponderado es 0,92: sigue
+  separando cuando la cámara y la fecha no pueden ayudarle.
+- El tamaño del archivo solo da ROC-AUC 0,58.
+
+**Dónde falla:** en fotos de baja resolución. En comercio con fotos de hasta 700 px de ancho
+detecta el 24 % (7 de 29); con 701 a 1.400 px, el 61 %; con más de 1.400 px, el 75 %. La
+cámara limita también al clasificador, no solo a las reglas.
+
+**Reservas:**
+
+- En comercio, 1920×1210, enero a agosto de 2026 hay 60 positivos y detecta el 92 % (ROC-AUC
+  0,99). Parece una oleada con una plantilla común que no quedó agrupada, porque sus códigos no
+  se leen: positivos de esa oleada están en entrenamiento y en prueba. Reconocer una plantilla
+  ya vista es útil en producción, pero infla la estimación frente a falsificaciones nuevas. El
+  dato más honesto para "una red que nunca se vio" es el de la parte 0: alrededor del 50 %.
+- No se sabe cuántos positivos son cédulas auténticas con identidad robada; esos no se pueden
+  detectar por la foto y bajan el techo. Los puntajes son muy polarizados: la mitad de los
+  positivos puntúa por encima de 0,96 y una cuarta parte por debajo de 0,11.
+- Es una sola corrida con una semilla. Las partes van de 62 % a 83 %.
+
+Falta: el modelo del frente, combinar las dos caras, Grad-CAM y revisar a ojo los positivos que
+no detecta.
+
+## 20. Modelo del frente y puntaje combinado (12-nov-2026)
+
+Alejandro corrió `python scripts/31_train.py --side front`
+(`runs/front_mobilenet_v3_large_512x320_20261112_2041`). Claude combinó las dos caras con
+`scripts/33_combine_sides.py` (nuevo; solo lee los puntajes ya guardados) y dejó el resultado en
+`runs/combined/`.
+
+**Detección con 2 % de falsos positivos, 410 positivos y 5.297 negativos:**
+
+| Puntaje | Detectados | PR-AUC | ROC-AUC |
+|---|---|---|---|
+| Reglas solas | 49 (12 %), con 1 falso positivo | — | — |
+| Reverso solo | 251 (61 %) | 0,71 | 0,91 |
+| Frente solo | 288 (70 %) | 0,78 | 0,93 |
+| **Promedio de frente y reverso** | **322 (79 %)** | **0,84** | **0,95** |
+| Promedio de las dos caras, o alguna regla en fallo | 332 (81 %), con 106 falsos positivos (2,0 %) | — | — |
+
+- El promedio no se entrena, así que no hay nada que sobreajustar. El máximo de las dos caras
+  da 77 % y el mínimo 71 %.
+- **Las dos caras se complementan:** con el umbral propio de cada una, 204 positivos los
+  detectan ambas, 84 solo el frente, 47 solo el reverso y 75 ninguna.
+- **Las reglas agregan 10 positivos** que el clasificador no detecta, a cambio de 1 negativo.
+- Por parte (promedio): 80 %, 86 %, 77 %, 83 % y 75 %.
+- Por canal: app 80 % (102 de 128), comercio 77 % (211 de 273), WhatsApp 9 de 9; falsos
+  positivos de 1,8 % y 2,0 % en app y comercio.
+- Por origen: `FRAUD` 79 % (238 de 302); red de la tienda 623, 80 % (63 de 79); AMORETT 65 %
+  (11 de 17); Finandina 3 de 4; verificador 7 de 8. La red estaba completa en la parte 0: su
+  modelo nunca la vio y detecta 77 de sus 100 personas.
+- Por periodo de registro: 76 % en el primer semestre de 2025, 73 % en el segundo, 91 % de
+  enero a agosto de 2026 y 78 % de septiembre a noviembre de 2026.
+
+**Revisión de cámara y fecha** (`32_audit_run.py` sobre `runs/combined` y sobre el frente): el
+puntaje que no mira la foto sigue en ROC-AUC 0,74 y 25 % de detección. Dentro de grupos con
+igual canal, tamaño de foto y periodo, el ROC-AUC ponderado es 0,96 con el frente y 0,96 con el
+promedio. No aprendió la cámara ni la fecha.
+
+**La resolución sigue siendo el límite:** en comercio, con fotos de hasta 700 px de ancho el
+promedio detecta el 41 % (12 de 29); con 701 a 1.400 px, el 81 %; con más de 1.400 px, el 83 %.
+
+**Reservas, las mismas del §19:** la oleada de comercio de enero a agosto de 2026 con fotos de
+1920×1210 se detecta en el 98 % (59 de 60), lo que apunta a una plantilla repetida entre
+entrenamiento y prueba; no se sabe cuántos de los 88 positivos no detectados son cédulas
+auténticas; es una sola corrida con una semilla y un solo tamaño de entrada.
+
+Falta: Grad-CAM, revisar a ojo los 88 positivos no detectados, calibrar el puntaje a 0–100 y el
+backtest.
+
+## 21. Segunda iteración y revisión de los no detectados (12-nov-2026)
+
+Alejandro preguntó si el modelo se puede mejorar y si valdría la pena no usar transferencia de
+aprendizaje. Respuesta de Claude: mantener la transferencia (con 410 positivos, una red desde
+cero casi con seguridad queda muy por debajo; es una expectativa, no una medición) y correr una
+vez la versión sin ella como comparación para el informe. Para mejorar, en orden de lo que se
+espera que aporte: limpiar las etiquetas revisando los no detectados, una entrada más grande
+(768×480), promediar varios modelos, otra red (EfficientNet-B0) y más positivos cuando el equipo
+de fraude confirme los de octubre y noviembre.
+
+Advertencia acordada: con 410 positivos no se hace búsqueda amplia de variantes. Se decide una
+lista corta de antemano, se corre completa y se reportan todos los resultados.
+
+`31_train.py` ganó las opciones `--no-pretrained`, `--seed` y `--lr` (probadas en una corrida
+corta). Ningún experimento de la segunda iteración se ha corrido.
+
+**Revisión visual de los no detectados.** Alejandro aceptó revisar a ojo los 88 positivos que el
+puntaje combinado no marca (10 de ellos sí fallan alguna regla). `33_combine_sides.py` deja la
+lista en `runs/combined/missed_positives.csv`, del puntaje más bajo al más alto, y
+`13_visual_review.py` se reescribió: `--queue` para mostrar solo esa lista, un clic por caso,
+botón para deshacer y sin mostrar los puntajes del modelo. La primera opción es "Looks genuine"
+(documento auténtico, el fraude estuvo en otra parte), que es la pregunta de fondo: cuántos
+fallos son del modelo y cuántos de la etiqueta. Probada sin interfaz contra los archivos
+locales, guardando en un archivo temporal.
+
+## 22. Resultados de la segunda iteración (13-nov-2026)
+
+Alejandro corrió las ocho corridas de la lista (otra semilla, 768×480, EfficientNet-B0 y sin
+transferencia, para frente y reverso). La revisión visual de los no detectados no se ha hecho.
+Las tablas completas están en `docs/data_summary.md` §13.
+
+**Resultados** (detección con 2 % de falsos positivos; frente, reverso y promedio de ambas):
+
+- Primera corrida: 70,2 %, 61,2 % y 78,5 % (322 de 410).
+- Otra semilla: 77,3 %, 62,4 % y 79,5 %.
+- Entrada de 768×480: 73,2 %, 60,7 % y 78,0 %.
+- EfficientNet-B0: 78,8 %, 68,5 % y 86,6 % (355).
+- Sin transferencia: 11,7 %, 23,2 % y 16,6 %.
+- **Promedio de las cuatro preentrenadas: 81,2 %, 71,7 % y 86,8 % (356 de 410)**; PR-AUC 0,89,
+  ROC-AUC 0,96. Con las reglas, 360 de 410 y 106 de 5.297 negativos.
+
+**Lectura.**
+
+- La semilla sola mueve el frente 7 puntos. Las diferencias entre corridas sueltas no alcanzan
+  para decir que una variante es mejor; lo que sí se sostiene es el promedio de varias, que mejora
+  8,3 puntos sobre la primera corrida (intervalo del 95 % por remuestreo: de 5,6 a 11,2).
+- El promedio usa las cuatro variantes preentrenadas sin escoger entre ellas. Se dejó así a
+  propósito: elegir la mejor combinación sobre la misma validación cruzada inflaría la cifra.
+- La entrada más grande no ayudó. EfficientNet-B0 salió mejor en las dos caras, pero con una
+  corrida por cara no se separa del efecto de la semilla.
+- Sin transferencia el modelo casi no aprende y es inestable entre partes. Varias partes pararon
+  temprano (entre 7 y 13 épocas), así que esto mide esta receta con estos datos, no un tope de lo
+  que una red desde cero podría lograr con más datos.
+- La red tienda 623 + AMORETT, nunca vista por su modelo: 93 de 100 (antes 77). Comercio con
+  fotos de hasta 700 px: 17 de 29 (antes 41 %).
+- Revisión de cámara y fecha sobre el promedio: ROC-AUC 0,98 dentro de grupos con igual canal,
+  tamaño y periodo; el puntaje que solo usa esos datos sigue en 0,74.
+- Quedan 54 positivos sin detectar (4 fallan alguna regla). De los 88 de antes se recuperan 35
+  y se pierde 1.
+
+**Cambios en el código.** `33_combine_sides.py` recibe ahora `--front` y `--back` con una o varias
+corridas y promedia las de cada cara; con la primera pareja reproduce `runs/combined` idéntico.
+El promedio de las cuatro quedó en `runs/ensemble`, y la lista para la revisión visual en
+`runs/ensemble/missed_positives.csv`.
+
+**Pendiente de decidir por Alejandro:** si el modelo final es el promedio de las cuatro variantes
+(ocho redes al puntuar una persona) o solo EfficientNet-B0 (dos redes). `docs/plan.md` no se
+cambió.
+
+**Pérdida y exactitud en el historial (13-nov-2026).** Alejandro preguntó por las curvas de
+pérdida de entrenamiento y de validación, que son las que en clase se usan para ver el
+sobreajuste. Hasta aquí `history.csv` solo guardaba la pérdida de entrenamiento y el PR-AUC de
+validación. `model/train.py` guarda ahora, por época, `train_loss`, `train_accuracy`, `val_loss`,
+`val_accuracy` y `val_pr_auc`; la pérdida de validación pesa los positivos igual que la de
+entrenamiento, para que las dos curvas se puedan comparar. La época que se conserva la sigue
+decidiendo el PR-AUC de validación: nada del entrenamiento cambió. Las corridas anteriores no
+tienen esas columnas; para la gráfica hay que repetir una. Probado con una corrida corta.
+
+**Paciencia de la parada temprana: de 4 a 8 (pedido de Alejandro, 13-nov-2026).** Es el valor por
+defecto de `31_train.py` y de `TrainConfig`, también para las corridas sin transferencia (antes
+6). Las diez corridas del 12 y 13-nov-2026 (incluida `runs/ensemble`) se hicieron con 4, o con 6
+las dos sin transferencia; cada `config.json` guarda la que usó. Las corridas nuevas no se
+comparan directamente con esas: la diferencia mezcla la paciencia con el azar de la GPU.

@@ -5,6 +5,7 @@ Every statement here is a SELECT and runs on a read-only session (see common.pg_
 Dates are evaluated in the database session time zone, the one pgAdmin also uses by default,
 so the counts match the queries in docs/plan.md (Anexo B).
 """
+import hashlib
 from collections.abc import Iterable, Iterator
 
 import pandas as pd
@@ -293,17 +294,38 @@ def one_row_per_person(labeled: pd.DataFrame, tenant_order: list[str]) -> pd.Dat
     return kept.drop(columns=["_negative", "_registered", "_tenant"]).reset_index(drop=True)
 
 
-def sample_negatives(df: pd.DataFrame, n: int, seed: int) -> set:
-    """client_ids of a sample of negatives stratified by registration month and channel,
-    proportional to stratum size (at least one per stratum)."""
+def sample_negatives(df: pd.DataFrame, n: int, seed: int, keep=frozenset(), always: dict | None = None) -> set:
+    """client_ids of the negatives that get images. Three parts, built so the choice does not
+    move when the export runs again:
+
+    keep     negatives whose photos are already on disk: always selected.
+    always   negatives the classifier needs so the sample resembles the positives, from
+             config.yaml: {"channels": [...], "registered_from": "YYYY-MM-DD"}. Every negative
+             of those channels, and every negative registered since that date.
+    sample   stratified by registration month and channel, proportional to stratum size (at
+             least one per stratum, about `n` in total). The kept ones count toward their
+             stratum; what is missing is taken in a fixed pseudo-random order that depends only
+             on the person and the seed, not on who else is in the dataset.
+    """
     neg = df[df["label"] == NEGATIVE]
     if len(neg) <= n:
         return set(neg["client_id"])
     month = pd.to_datetime(neg["registered_date"]).dt.strftime("%Y-%m")
     stratum = month + "|" + neg["channel"].fillna("?").astype(str)
+    key = neg["anon_id"] if "anon_id" in neg else neg["client_id"]
+    order = key.map(lambda value: hashlib.sha256(f"{seed}:{value}".encode()).hexdigest())
+    kept = neg["client_id"].isin(set(keep))
     frac = n / len(neg)
-    chosen: set = set()
-    for _, group in neg.groupby(stratum, sort=True):
-        k = min(len(group), max(1, round(len(group) * frac)))
-        chosen |= set(group.sample(k, random_state=seed)["client_id"])
+    chosen = set(neg.loc[kept, "client_id"])
+    for _, index in neg.groupby(stratum, sort=True).groups.items():
+        quota = min(len(index), max(1, round(len(index) * frac)))
+        missing = quota - int(kept[index].sum())
+        if missing > 0:
+            candidates = order[index][~kept[index]].sort_values()
+            chosen |= set(neg.loc[candidates.index[:missing], "client_id"])
+    if always:
+        mask = neg["channel"].isin(always.get("channels") or [])
+        if always.get("registered_from"):
+            mask |= pd.to_datetime(neg["registered_date"]) >= pd.Timestamp(always["registered_from"])
+        chosen |= set(neg.loc[mask, "client_id"])
     return chosen

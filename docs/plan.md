@@ -1,7 +1,30 @@
 # Detector de cédulas falsas — Plan final del proyecto de grado
 
-**Autor:** Alejandro Trujillo López · **Versión final:** 2026-11-09 · **Última actualización:** 2026-11-11
+**Autor:** Alejandro Trujillo López · **Versión final:** 2026-11-09 · **Última actualización:** 2026-11-12
 **Fuentes:** carpeta "Proyecto de grado", notebooks de Deep Learning, repositorios `mikro_back` y `mikro_front`, conteos ejecutados en `sisteya_live` por Alejandro.
+
+---
+
+## 0. Estado y decisiones del 12-nov-2026
+
+Esta sección resume lo que se midió y decidió al cerrar la fase 1. **Donde el texto de las secciones siguientes diga otra cosa, vale lo de aquí.** Las cifras completas están en `docs/data_summary.md`.
+
+**Lo que se midió**
+
+- **Dataset:** 28.292 personas, una fila por cédula: **410 positivos y 27.882 negativos**. Positivos por origen: `FRAUD` 302, red de la tienda 623 79, comercio AMORETT 17, verificador del equipo (confirmadas por analista) 8, Finandina con Libre Destino 4.
+- **El texto guardado en producción no alcanza:** en comercio solo el 10 % de los clientes lo tiene. Se volvió a leer con Rekognition a los 410 positivos y a 4.257 negativos (9,53 USD, en una cuenta de AWS aparte de la corporativa).
+- **El código del reverso se lee poco, por la cámara:** en el 58 % de los positivos y el 35 % de los negativos de app, y en el 22 % y el 14 % de los de comercio. Las fotos de comercio son en su mayoría de 1280×720 o menos; ampliar la cédula antes de leerla no mejora nada.
+- **Reglas:** 49 de 410 positivos fallan alguna (12 %) y 1 de 4.257 negativos. Solo detectan la del reverso repetido (37), la del registrador (19) y la de fecha de producción (2); las demás no fallan en nadie. Detectan sobre todo redes que reutilizan reversos: 26 de 79 en la tienda 623 y 8 de 17 en AMORETT, frente a 14 de 302 en el resto.
+- **El recorte con OpenCV no funciona con fotos reales:** encontró la cédula en 4 de 188 fotos.
+
+**Decisiones de Alejandro**
+
+1. **Papel de las reglas.** Son evidencia adicional: suman al indicador cuando fallan y le dan al analista un motivo concreto. El **clasificador de imágenes es el componente principal**, porque en comercio las reglas casi nunca se pueden evaluar. No se agregan reglas nuevas ni se lee el texto de los 23.625 negativos restantes.
+2. **Dónde se entrena.** En el equipo de Alejandro (NVIDIA RTX 2070 de 8 GB). Las fotos no salen de la máquina. El modelo se escribe en **PyTorch**: TensorFlow no usa la tarjeta gráfica en Windows, y la receta es la misma del Taller 1 (base preentrenada congelada, cabeza nueva, luego afinar las últimas capas).
+3. **Negativos para entrenar.** Emparejados con los positivos, no proporcionales: además de la muestra por mes y canal, entran **todos los negativos de app (980) y todos los registrados desde septiembre de 2026 (301)**. Quedan unos 5.300 negativos con fotos. El sorteo es estable: quien ya tiene fotos en disco no sale de la muestra.
+4. **Recorte.** El primer modelo se entrena **sin recortar**, con la foto completa reducida. La cédula ya ocupa cerca del 75 % del ancho del cuadro. Si ese modelo queda corto, se compara contra una versión recortada (por las cajas de texto de Rekognition o con un detector).
+5. **Evaluación.** **Validación cruzada en cinco partes por persona**, con cada red completa (tienda 623, AMORETT) dentro de una sola parte, para medir si el modelo reconoce falsificaciones y no la plantilla de una red. Llévalo Ya tiene 20 positivos y no sirve como prueba externa. Los resultados se reportan por canal y por origen del positivo.
+6. **Revisión visual.** Aplazada: se revisan a ojo solo los positivos que el primer modelo no detecte.
 
 ---
 
@@ -11,7 +34,7 @@
 
 **Solución.** Dos componentes que alimentan un **indicador de riesgo de falsificación de 0 a 100**: un **motor de reglas estructurales** determinista sobre el texto del reverso (registrador vs. fecha, coherencia del código, lista negra de reversos clonados), validado estadísticamente con los datos históricos, y un **clasificador de imágenes** para lo visual. Se construye con **transferencia de aprendizaje**: una red convolucional ya entrenada en millones de imágenes (MobileNetV3 o EfficientNet) a la que se le reemplaza la última capa y se afina con las cédulas reales y falsas de SisteYa. Antes de entrar a la red, la foto pasa por un preprocesamiento clásico con OpenCV que recorta y endereza la cédula para que la red vea solo el documento. El indicador se integra al motor de puntaje de fraude que ya existe, primero en modo observación.
 
-**Datos.** ~399 cédulas de fraude confirmado sin crédito pagado (281 FRAUD + 78 de la red de sep–oct 2026 en ESMIO, 40 en Llévalo Ya) y unas 28.000 cédulas de clientes que pagaron al menos un crédito, todas con frente y reverso, registradas desde 2025. Las fotos ya están en S3; las etiquetas ya están en la base.
+**Datos.** 410 cédulas de fraude confirmado sin crédito pagado y 27.882 cédulas de clientes que pagaron al menos un crédito, una por persona, todas con frente y reverso, registradas desde 2025 (conteo del 12-nov-2026; detalle en §0 y en `docs/data_summary.md`). Las fotos ya están en S3; las etiquetas salen de la base y de los casos confirmados por el equipo de fraude.
 
 **Resultado esperado.** Un prototipo que, sobre los fraudes históricos, muestre cuántos habría enviado a revisión y a qué costo en falsos positivos, con una explicación visual (mapa de calor) de por qué cada cédula es sospechosa.
 
@@ -119,12 +142,13 @@ Origen: el "Verificador de Cédulas" del equipo de verificación manual (artifac
 
 **Transferencia de aprendizaje, no una red desde cero.** Con ~399 positivos no es posible entrenar una red convolucional desde cero; los pesos preentrenados en ImageNet ya saben reconocer bordes, texturas y formas, y solo hay que enseñarles qué distingue una cédula falsa. Se congela la base, se entrena la cabeza, y luego se liberan las últimas capas con una tasa de aprendizaje baja (receta del Taller 1 con MobileNetV3).
 
-**Recorte clásico, no una red detectora.** La cédula siempre está cerca del centro, casi horizontal y ocupa buena parte del cuadro (por la guía visual de la app), así que detectar su contorno con OpenCV es suficiente. Se mide en una muestra de 50 fotos por tenant; si recorta bien menos del 90 %, se entrena YOLO (Taller 2) como respaldo. El recorte importa porque sin él la red podría aprender el fondo (mesa, mano) en vez del documento.
+**Recorte clásico, no una red detectora.** La cédula siempre está cerca del centro, casi horizontal y ocupa buena parte del cuadro (por la guía visual de la app), así que detectar su contorno con OpenCV es suficiente. Se mide en una muestra de 50 fotos por tenant; si recorta bien menos del 90 %, se entrena YOLO (Taller 2) como respaldo. El recorte importa porque sin él la red podría aprender el fondo (mesa, mano) en vez del documento. **Medido el 2026-11-12: este recorte encontró la cédula en 4 de 188 fotos reales, así que no se usa. El primer modelo se entrena sin recortar (§0, decisión 4).**
 
 **Lo que se descartó y por qué.** El autoencoder para anomalías (en fotos reales el error de reconstrucción sigue al desenfoque y la luz, no a la falsedad; funciona en MNIST, no aquí). El ELA (análisis de recompresión JPEG: la captura es un PNG generado en canvas, sin JPEG). Un fusor complejo de varios modelos (con una sola receta, la probabilidad calibrada es el indicador). Quedan como trabajo futuro: análisis por zonas del documento, rama de residuo de ruido, y comparación de embeddings del serial entre clientes.
 
 ### 3.3 Detalles de entrenamiento
 
+- **Vigente desde el 2026-11-12 (§0):** PyTorch en el equipo de Alejandro; entrada sin recortar; unos 5.300 negativos emparejados por canal y periodo; validación cruzada en cinco partes. Los puntos de abajo se mantienen donde no contradicen esto (los nombres `class_weight`, `ModelCheckpoint` y `EarlyStopping` son de Keras; en PyTorch se hace lo mismo con pesos en la pérdida, guardado del mejor modelo y parada temprana).
 - Entrada: cédula rectificada a **384–512 px** de ancho (más que los 224 habituales, para no perder tipografía y bordes finos).
 - Aumento de datos conservador: brillo, contraste, desenfoque leve, rotación de ±5°, compresión. **Nunca** volteos ni recortes agresivos, porque destruyen la señal.
 - `class_weight` para el desbalance; muestra de 3.000–5.000 negativos variados en mes y canal para entrenar; `ModelCheckpoint` + `EarlyStopping` sobre PR-AUC de validación.
@@ -188,9 +212,13 @@ Positivos de ESMIO por mes: dos olas (abr–jun 2025 y feb–may 2026) más un g
    - **Reverso repetido en el backtest.** `12_ocr_coverage.py` lo calcula sobre todo el dataset a la vez; en producción solo se puede comparar contra clientes anteriores. El backtest de la fase 5 debe calcularlo así.
 
 ### 5.5 Particiones
-- Entrenamiento y validación: ESMIO, separado **por cliente y por tiempo** (entrenar con 2025, validar con 2026) para que el modelo no aprenda el celular o la fecha de una ola concreta.
-- Prueba externa: **Llévalo Ya completo** (40 positivos, 12.075 negativos), nunca visto en entrenamiento. Demuestra que generaliza a otra marca, otros comercios y otros dispositivos.
-- Evaluación de falsos positivos sobre **todos** los negativos, no sobre la muestra de entrenamiento.
+**Vigente (decisión del 2026-11-12):**
+- **Validación cruzada en cinco partes, por persona.** Cada persona está en una sola parte; cada modelo se entrena con cuatro y se evalúa en la quinta, de modo que todos los positivos se evalúan una vez sin haber sido vistos.
+- **Cada red completa en una sola parte** (los 79 de la tienda 623 y los 17 de AMORETT, y en general quienes comparten reverso). Así la evaluación de una red se hace con un modelo que nunca vio esa plantilla.
+- Las partes se reparten parejo en etiqueta y canal, y se guardan una vez en `splits.csv`.
+- Se reporta por canal y por origen del positivo, además del total.
+
+**Descartado:** la partición por tiempo (entrenar con 2025, validar con 2026) y Llévalo Ya como prueba externa. Con una fila por persona, Llévalo Ya quedó con 20 positivos, y 114 de los 410 positivos son de septiembre a noviembre de 2026: partir por tiempo dejaría la validación dominada por dos redes.
 
 ### 5.6 Privacidad
 Datos personales sensibles (Ley 1581 de 2012). El dataset se construye con identificadores anonimizados (hash del documento), se trabaja sobre los recortes de la cédula, en almacenamiento con acceso restringido, y nunca se suben fotos a servicios públicos (Colab abierto, Roboflow público). Queda documentado en la tesis.
@@ -209,7 +237,7 @@ Datos personales sensibles (Ley 1581 de 2012). El dataset se construye con ident
 
 ## 6b. Repositorio del proyecto (creado 2026-11-09)
 
-Carpeta `Proyecto de grado/id_fraud_detector/`, independiente de `mikro_back` (se convertirá en repositorio). Código en inglés, documentación en español. Incluye `CLAUDE.md` con el contexto para Claude Code y `docs/plan.md` (copia de este documento) para trabajar desde VS Code. Lee la base en solo lectura y S3 con boto3; no usa Django. No guarda credenciales: usa la sesión de SSO de AWS, toma el acceso a la base del secreto `sisteya_db_proxy_credentials` de Secrets Manager y elige el entorno con `STAGE` en `.env` (base `sisteya_<STAGE>`, salidas en `data/<STAGE>/`). Pendiente: dónde se entrena (máquina local, AWS o Colab Pro).
+Carpeta `Proyecto de grado/id_fraud_detector/`, independiente de `mikro_back` (se convertirá en repositorio). Código en inglés, documentación en español. Incluye `CLAUDE.md` con el contexto para Claude Code y `docs/plan.md` (copia de este documento) para trabajar desde VS Code. Lee la base en solo lectura y S3 con boto3; no usa Django. No guarda credenciales: usa la sesión de SSO de AWS, toma el acceso a la base del secreto `sisteya_db_proxy_credentials` de Secrets Manager y elige el entorno con `STAGE` en `.env` (base `sisteya_<STAGE>`, salidas en `data/<STAGE>/`). Se entrena en el equipo de Alejandro, con PyTorch (decisión del 2026-11-12).
 
 **Un solo repositorio para todo el proyecto (decisión 2026-11-11).** Datos, reglas, clasificador, evaluación, indicador y servicio de inferencia viven aquí, porque el recorte y las reglas deben ser exactamente el mismo código al entrenar, al evaluar y al servir. Lo único que queda fuera son los cambios dentro de `mikro_back` de la fase 6 (campo `data_doc_risk` y regla `FV_DOC_IMAGE_RISK`), que viven allá y consumen lo que este repositorio expone.
 
@@ -227,14 +255,15 @@ id_fraud_detector/
     fresh_ocr.py            fase 1: OCR nuevo con Rekognition en otra cuenta   [existe]
     rules/                  fase 1: registradores, parser del OCR, motor       [existe]
     crop.py                 fase 2: recorte y enderezado con OpenCV            [existe]
-    model/                  fase 3: carga de datos, red, entrenamiento, Grad-CAM
-    evaluation/             fases 3 y 5: particiones, métricas, backtest
+    model/                  fase 3: carga de datos, red, entrenamiento         [existe]; Grad-CAM por hacer
+    evaluation/             fases 3 y 5: particiones y métricas                [existe]; backtest por hacer
     risk.py                 fase 5: combinación y calibración a 0–100
     pipeline.py             fase 5: una función, fotos + OCR -> riesgo
   scripts/                  puntos de entrada delgados; el primer dígito es la fase
     10_check_database.py    11_export_dataset.py    12_ocr_coverage.py    13_visual_review.py
-    14_fresh_ocr.py         20_crop_test.py
-    3x_*.py                 fase 3 (particiones, entrenamiento, evaluación)
+    14_fresh_ocr.py         15_enlarged_ocr_test.py 16_check_new_positives.py 17_data_summary.py
+    20_crop_test.py         30_make_splits.py       31_train.py
+    3x_*.py                 fase 3: lo que falta (combinar caras, Grad-CAM)
     5x_*.py                 fase 5 (calibración, backtest)
   notebooks/                (por crear) solo exploración, sin lógica
   tests/                    pruebas con datos sintéticos
@@ -257,8 +286,8 @@ Reglas de organización:
 | Fase | Duración | Entregable | Apoyo de clase |
 |---|---|---|---|
 | 1. Dataset | 2–3 sem | Verificaciones previas (`10_check_database.py`); exportación con `11_export_dataset.py` (~399 pos, muestra de neg con imágenes para entrenar, todos los neg con OCR para evaluar las reglas); manifest anonimizado; medición de las reglas (`12_ocr_coverage.py`); revisión visual por modalidad aplazada al análisis de errores (fase 4); exploración con embeddings + t-SNE para ver si los fraudes se agrupan | Clase 4 (embeddings), Gatos/Perros (carga por carpetas) |
-| 2. Recorte | 1 sem | Contorno + homografía con OpenCV; medir % de recorte correcto en 50 fotos por tenant; cola de "no recortadas" | OpenCV; Taller 2 (YOLO) solo si falla |
-| 3. Modelo | 3–4 sem | Redes de frente y reverso por transferencia; partición por cliente y tiempo; métricas, Grad-CAM; línea base sin recorte | Taller 1 (MobileNetV3), Gatos/Perros |
+| 2. Recorte | 1 sem | Hecho el 2026-11-12: el recorte con OpenCV encontró la cédula en 4 de 188 fotos. Se entrena sin recorte y se retoma solo si el primer modelo queda corto | OpenCV; Taller 2 (YOLO) solo si falla |
+| 3. Modelo | 3–4 sem | Redes de frente y reverso por transferencia (PyTorch, foto completa); validación cruzada en cinco partes por persona; métricas por canal y origen, Grad-CAM | Taller 1 (MobileNetV3), Gatos/Perros |
 | 4. Iteración | 2 sem | Según análisis de errores: resolución, zonas, residuo de ruido, sintéticos para modalidades escasas | — |
 | 5. Indicador y backtest | 1 sem | Calibración 0–100, umbrales, backtest histórico, prueba externa en Llévalo Ya | `05-backtest-esmio.html` |
 | 6. Integración (opcional) | 2 sem | Servicio de inferencia (Lambda container o SageMaker), campo `data_doc_risk`, regla `FV_DOC_IMAGE_RISK` en SHADOW, mapa de calor en el panel de revisión | `docs/fraud-score/03-plan.html` |
@@ -273,7 +302,8 @@ El proyecto de grado queda completo con las fases 1, 2, 3 y 5. Las fases 4 y 6 s
 |---|---|
 | El modelo aprende el dispositivo o la fecha de una ola, no la falsificación | Partición por cliente y tiempo; negativos del mismo período; prueba externa en otro tenant; Grad-CAM revisado |
 | Parte de los positivos son documentos reales con identidad robada | Revisión visual de los positivos que el primer modelo no detecta (ya no previa: decisión del 2026-11-12); esos casos salen de los positivos y se reentrena |
-| El recorte falla en fondos difíciles | Medir en muestra; cola de revisión manual; YOLO como respaldo |
+| El recorte falla en fondos difíciles | Ocurrió: falló en el 98 % de las fotos. El primer modelo va sin recorte; si hace falta, se recorta por las cajas de texto o con un detector, y se revisa con Grad-CAM que la red mire el documento |
+| Las reglas casi no se pueden evaluar en comercio (la cámara no deja leer el código) | El clasificador es el componente principal; se recomienda a la empresa exigir una resolución mínima en la captura de comercio |
 | Dos tipos de cédula con apariencia distinta | Incluir ambos desde el inicio y reportar métricas por tipo |
 | El estafador cambia de método | Modo SHADOW con monitoreo; reentrenamiento con lo que marque el analista; trabajo futuro en detección de anomalías |
 

@@ -45,6 +45,10 @@ scripts/                    puntos de entrada; el primer dígito es la fase
   15_enlarged_ocr_test.py   fase 1 · prueba: ¿se lee mejor el reverso si se envía la cédula ampliada?
   16_check_new_positives.py fase 1 · cuenta los positivos confirmados fuera de fraud_status (solo lectura)
   17_data_summary.py        fase 1 · cifras del dataset para el informe (solo archivos locales)
+  30_make_splits.py         fase 3 · reparte a las personas con fotos en cinco partes
+  31_train.py               fase 3 · entrena el clasificador de una cara con validación cruzada
+  32_audit_run.py           fase 3 · revisa si el modelo sigue la falsificación o la cámara y la fecha
+  33_combine_sides.py       fase 3 · un puntaje por persona con frente y reverso, más las reglas
   20_crop_test.py           fase 2 · hoja de contacto para juzgar el recorte en 50 fotos por tenant
 tests/                      pruebas con datos sintéticos (reglas, etiquetado, conexión)
 data/<STAGE>/               (git-ignored) dataset, OCR, imágenes, resultados; private/ tiene datos reales
@@ -159,6 +163,8 @@ Las rutas `data/...` que aparecen abajo son relativas a la carpeta del entorno: 
 | 6 | `python scripts/11_export_dataset.py` | Base (lectura) y S3 | depende de la red; ~8.800 fotos |
 | 7 | `streamlit run scripts/13_visual_review.py` | Solo archivos locales | manual, ~381 casos |
 | 8 | `python scripts/20_crop_test.py` | Solo archivos locales | < 1 min |
+| 9 | `python scripts/30_make_splits.py` | Solo archivos locales | < 1 min |
+| 10 | `python scripts/31_train.py --side back` (y `--side front`) | Solo archivos locales y la GPU | ~20 min por cara |
 
 Salvo el paso 2, los tiempos son estimados.
 
@@ -204,8 +210,13 @@ Por cada tenant:
    fotos), y el orden de las marcas en `config.yaml`. Las fotos son las de la marca de la fila
    que queda; la columna `labeled_in` dice en qué marcas está etiquetada la persona. Luego
    calcula `anon_id` y `person_id` con `ANON_SALT`.
-3. Elige las fotos a descargar: todos los positivos y una muestra de negativos estratificada por
-   mes y canal (2.500 en ESMIO, 1.500 en Llévalo Ya; `config.yaml`).
+3. Elige las fotos a descargar: todos los positivos y una parte de los negativos, definida en
+   `config.yaml`:
+   - una muestra estratificada por mes y canal (2.500 en ESMIO, 1.500 en Llévalo Ya);
+   - todos los negativos de app y todos los registrados desde septiembre de 2026, para que los
+     negativos se parezcan a los positivos (`negatives_always_with_images`);
+   - todos los que ya tienen sus fotos en disco. Por eso la muestra no se mueve al volver a
+     exportar: solo crece.
 4. Trae el OCR guardado de **todas** las personas, en lotes de 300 clientes. La base devuelve
    solo las líneas de texto con su confianza, no el JSON completo de Rekognition. Lo guarda en
    `data/ocr/<anon_id>.json`.
@@ -286,6 +297,81 @@ encontró texto, la amplía al doble y la envía de nuevo. No lee nada de S3. Gu
 la foto completa y con la cédula ampliada, cuántos se ganan y cuántos se pierden. Sin `--run`
 solo informa. Usa la misma comprobación de cuentas que `14_fresh_ocr.py`. Cuesta unos 0,20 USD.
 
+### `30_make_splits.py` — las cinco partes de la validación cruzada (fase 3)
+No se conecta a nada. Toma a las personas con ambas fotos en disco y las reparte en cinco partes,
+que guarda en `data/splits.csv`. Cada persona queda en una sola parte; una red completa (tienda
+623, AMORETT) y quienes comparten reverso quedan juntos, para que el modelo que los evalúa nunca
+haya visto esa plantilla. Las partes quedan parejas en etiqueta y canal. Se corre una sola vez;
+`--force` la rehace si cambia el dataset.
+
+### `31_train.py` — entrenamiento del clasificador (fase 3)
+No se conecta a nada; entrena en este equipo con PyTorch (usa la tarjeta gráfica si la hay).
+Requiere `pip install -e ".[review,train]"` con PyTorch instalado desde su índice con soporte de
+GPU (ver `pyproject.toml`).
+
+```powershell
+python scripts/31_train.py --side back
+python scripts/31_train.py --side front
+```
+
+Por cada parte entrena un modelo con tres partes, lo vigila con una cuarta (parada temprana) y
+puntúa la quinta, que nunca vio. Al final cada persona tiene un puntaje dado por un modelo que no
+entrenó con ella ni con su red, y sobre esos puntajes se calculan las métricas: PR-AUC, ROC-AUC y,
+la principal, cuántas falsas se detectan dejando pasar a revisión solo al 2 % de las legítimas.
+Se reportan en total, por parte, por canal y por origen del positivo.
+
+- **Modelo:** MobileNetV3 preentrenada en ImageNet (`--arch efficientnet_b0` para la otra), con
+  una cabeza nueva de una salida. Primero se entrena solo la cabeza; luego se liberan los
+  últimos bloques con tasa de aprendizaje baja.
+- **Entrada:** la foto completa, sin recortar, reducida a 512×320. La primera vez reduce todas
+  las fotos y las deja en `data/cache/`; las corridas siguientes ya no las decodifican.
+- **Aumento de datos:** leve (brillo, contraste, pocos grados de giro, desplazamiento y zoom
+  pequeños). Nunca voltea ni recorta la cédula.
+- **Resultados:** en `runs/<nombre>/` (fuera de git): configuración, historia de cada época,
+  puntajes por persona, métricas y los pesos de cada modelo.
+
+`--limit 400 --epochs 2 --folds 0` hace una prueba rápida.
+
+Opciones para comparar variantes (cada corrida queda en su propia carpeta de `runs/`):
+
+| Opción | Para qué |
+|---|---|
+| `--size 768x480` | Entrada más grande: conserva más detalle fino de las fotos de alta resolución |
+| `--arch efficientnet_b0` | Otra red preentrenada |
+| `--seed 7` | Repite con otra semilla (la partición no cambia): mide cuánto varía el resultado |
+| `--blocks 12`, `--lr 5e-5` | Cuántos bloques se liberan y con qué tasa de aprendizaje |
+| `--no-pretrained` | Solo para comparar: parte de pesos al azar, sin transferencia de aprendizaje |
+
+### `32_audit_run.py` — ¿el modelo mira el documento o la cámara? (fase 3)
+No se conecta a nada. Lee los puntajes de una corrida (`runs/<nombre>/`) y las fotos en disco:
+
+```powershell
+python scripts/32_audit_run.py runs/<nombre>
+```
+
+El canal decide la cámara y los positivos se concentran en ciertos meses, así que una red podría
+puntuar bien aprendiendo eso. El script compara el clasificador contra "modelos" que no miran la
+foto (solo canal, tamaño de la foto y periodo de registro) y mide cómo separa dentro de grupos
+donde cámara y fecha son iguales para todos. También da detección y falsos positivos por ancho de
+foto y por periodo. Solo imprime conteos y tasas.
+
+### `33_combine_sides.py` — un puntaje por persona (fase 3)
+No se conecta a nada. Toma los puntajes de una o varias corridas del frente y del reverso:
+
+```powershell
+python scripts/33_combine_sides.py --front runs/<corrida del frente> --back runs/<corrida del reverso>
+python scripts/33_combine_sides.py --front runs/<frente 1> runs/<frente 2> --back runs/<reverso 1> runs/<reverso 2> --name ensemble
+```
+
+Con varias corridas de una cara, el puntaje de esa cara es el promedio simple de sus puntajes
+(nada se ajusta, todas pesan igual). Todas deben venir de la misma partición.
+
+Compara cada cara sola con tres combinaciones simples (promedio, la más alta, la más baja); se
+queda con el promedio, que no se entrena. Muestra cuánto se solapan las dos caras, el puntaje
+combinado por parte, canal y origen, y el clasificador junto con las reglas (se marca a una
+persona si el puntaje pasa el umbral o si alguna regla falló). Lo deja en `runs/<name>/`
+(`combined` si no se da `--name`), que también se puede revisar con `32_audit_run.py`.
+
 ### `17_data_summary.py` — cifras del dataset
 No se conecta a nada. Lee el manifest, los archivos de OCR, las fotos en disco y los resultados
 de los demás scripts, y escribe una tabla pequeña por tema en `data/summary/*.csv`: universo de
@@ -311,8 +397,19 @@ su `fraud_status`, si tienen crédito pagado, qué etiqueta tienen hoy y cuánto
 nuevos. Solo imprime conteos.
 
 ### `13_visual_review.py` — revisión visual de positivos
-App local de Streamlit. Muestra frente y reverso de cada positivo y guarda la modalidad elegida en
-`data/review/modalities.csv`. Retoma donde quedó.
+App local de Streamlit. Muestra frente y reverso de un positivo a la vez; un clic en la
+modalidad la guarda en `data/review/modalities.csv` y pasa al siguiente. Retoma donde quedó, y
+"Undo last" deshace la última respuesta.
+
+Por defecto recorre todos los positivos. Con `--queue` muestra solo a las personas de una lista,
+en ese orden; así se revisan los positivos que el clasificador no detectó, que es para lo que se
+usa (la revisión de todos se descartó por el tiempo que toma):
+
+```powershell
+streamlit run scripts/13_visual_review.py -- --queue runs/ensemble/missed_positives.csv
+```
+
+No muestra los puntajes del modelo, para que la respuesta no se apoye en ellos.
 
 ### `20_crop_test.py` — prueba del recorte (fase 2)
 No se conecta a nada. Toma 25 positivos y 25 negativos por tenant de las fotos descargadas, corre

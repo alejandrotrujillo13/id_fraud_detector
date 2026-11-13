@@ -23,7 +23,7 @@ los repositorios `mikro_back` y `mikro_front`; este proyecto es **independiente*
 - **Existe:** el paquete instalable `id_fraud_detector` (`src/id_fraud_detector/`, instalado con
   `pip install -e ".[review]"`) con las consultas y el etiquetado (`dataset.py`), el motor de
   reglas estructurales (`rules/`) y el recorte con OpenCV (`crop.py`); los scripts de la fase 1
-  (`10` a `14`) y de la fase 2 (`20`) en `scripts/`; y pruebas en `tests/`
+  (`10` a `17`), de la fase 2 (`20`) y de la fase 3 (`30` a `33`) en `scripts/`; y pruebas en `tests/`
   (`python -m unittest discover tests`). Todo se probó con datos sintéticos y con una base y un
   S3 simulados.
 - **Corrido contra `dev`:** el 11-nov-2026 Alejandro corrió las verificaciones previas con
@@ -86,23 +86,68 @@ los repositorios `mikro_back` y `mikro_front`; este proyecto es **independiente*
   números reales, solo local). Las cifras de este bloque más arriba (381 positivos, 4.017
   negativos) son de corridas anteriores del mismo día.
 - **El recorte con OpenCV no funciona con fotos reales** (`20_crop_test.py`, 12-nov-2026: 4 de
-  188 fotos). Hay que replantearlo antes de entrenar; la cédula ya ocupa cerca del 75 % del
-  ancho del cuadro.
-- **La muestra de negativos se mueve al re-exportar** (el sorteo depende de quién haya en cada
-  grupo de mes y canal). Pendiente hacerla estable antes de la próxima exportación.
-- **Siguiente paso:** fase 2. Decidir qué se hace con el recorte, la muestra de negativos
-  (proporcional o emparejada por canal y periodo), cómo se evalúa y dónde se entrena. El equipo
-  de Alejandro tiene una NVIDIA RTX 2070 de 8 GB y 153 GB libres en disco (medido el
-  12-nov-2026); sin PyTorch ni TensorFlow instalados. Las 15 cédulas "falsas" del verificador
-  sin registro de origen **no** se incluyen (decisión de Alejandro del 12-nov-2026). Leer los 23.855 negativos restantes (~48 USD) quedó en duda: Claude
-  recomendó no hacerlo y Alejandro no lo ha decidido de forma explícita. Tampoco ha confirmado
-  el cambio de papel de las reglas en `docs/plan.md` (evidencia adicional; el clasificador como
-  componente principal). La muestra de negativos (`docs/context.md` §9, decisión 3) debe decidirse
-  antes de descargar imágenes para el clasificador.
-- **NO existe:** ningún modelo entrenado, ningún notebook de entrenamiento, ninguna integración
-  con `mikro_back`. Eso es fase 3 en adelante.
-- **Pendiente de decisión del usuario:** dónde se entrena (máquina local, AWS de la empresa o
-  Colab Pro con datos cifrados). No asumas ninguna.
+  188 fotos). La cédula ya ocupa cerca del 75 % del ancho del cuadro.
+- **Decisiones de Alejandro para el clasificador (12-nov-2026; `docs/plan.md` §0 y
+  `docs/context.md` §17). No las vuelvas a preguntar:**
+  1. Las reglas son evidencia adicional; **el clasificador de imágenes es el componente
+     principal**. No se agregan reglas ni se lee el texto de los ~23.600 negativos restantes.
+  2. **Se entrena en el equipo de Alejandro** (RTX 2070 de 8 GB), con **PyTorch** (TensorFlow no
+     usa la GPU en Windows). Las fotos no salen de la máquina.
+  3. **Negativos emparejados con los positivos:** además de la muestra por mes y canal, todos los
+     de app y todos los registrados desde septiembre de 2026 (`negatives_always_with_images` en
+     `config.yaml`); unos 5.300 con fotos. El sorteo es estable: quien ya tiene fotos en disco
+     no sale de la muestra.
+  4. **El primer modelo va sin recorte**, con la foto completa reducida.
+  5. **Validación cruzada en cinco partes por persona**, con cada red completa (tienda 623,
+     AMORETT) en una sola parte. Llévalo Ya ya no es prueba externa.
+  6. Las 15 cédulas "falsas" del verificador sin registro de origen **no** se incluyen.
+- **Muestra emparejada exportada (12-nov-2026, `docs/context.md` §18):** 28.293 personas, 410
+  positivos y 27.883 negativos; **5.707 personas con fotos y con texto nuevo de Rekognition**
+  (410 positivos y 5.297 negativos). Gasto total en Rekognition: 11,61 USD. Las cifras vigentes
+  están en `docs/data_summary.md`.
+- **Fase 3 empezada (12-nov-2026):** existen `evaluation/splits.py`, `evaluation/metrics.py`,
+  `model/data.py`, `model/net.py`, `model/train.py`, `scripts/30_make_splits.py` y
+  `scripts/31_train.py`. `data/live/splits.csv` ya está hecho (cinco partes). PyTorch 2.14.1 con
+  GPU está instalado en `.venv` (`pip install torch torchvision --index-url
+  https://download.pytorch.org/whl/cu126`). El entrenamiento se probó con una corrida corta;
+  **ningún modelo completo se ha entrenado**.
+- **La tienda 623 y AMORETT son una sola red:** comparten reversos y quedaron en un grupo de 100
+  personas, todo en la parte 0 de la partición. 100 de los 128 positivos de app son de esa red.
+  Los resultados hay que leerlos por origen del positivo, no solo en total.
+- **Primer modelo del reverso (12-nov-2026, `docs/context.md` §19;
+  `runs/back_mobilenet_v3_large_512x320_20261112_1952`):** detecta el **61 % de los positivos
+  con 2 % de falsos positivos** (251 de 410; PR-AUC 0,71; ROC-AUC 0,91), contra el 12 % de las
+  reglas. La red tienda 623 + AMORETT, que su modelo nunca vio, se detecta en cerca del 50 %.
+  `scripts/32_audit_run.py` muestra que no aprendió la cámara ni la fecha (ROC-AUC 0,92 dentro
+  de grupos con igual canal, tamaño de foto y periodo; 0,74 un puntaje que solo usa esos
+  datos). Falla en fotos de baja resolución (24 % en comercio con hasta 700 px de ancho).
+- **Modelo del frente y puntaje combinado (12-nov-2026, `docs/context.md` §20;
+  `runs/front_mobilenet_v3_large_512x320_20261112_2041` y `runs/combined`):** el frente solo
+  detecta el 70 % (288 de 410); **el promedio de frente y reverso, el 79 % (322 de 410) con 2 %
+  de falsos positivos** (PR-AUC 0,84; ROC-AUC 0,95); con las reglas, el 81 % (332). La red
+  tienda 623 + AMORETT, nunca vista por su modelo, se detecta en 77 de 100. La revisión de
+  cámara y fecha sigue limpia (ROC-AUC 0,96 dentro de grupos iguales). En comercio con fotos de
+  hasta 700 px de ancho detecta el 41 %. Las cifras están en `docs/data_summary.md` §12.
+- **Segunda iteración (corrida el 12 y 13-nov-2026, `docs/context.md` §22;
+  `docs/data_summary.md` §13):** ocho corridas (otra semilla, entrada de 768×480,
+  EfficientNet-B0 y sin transferencia, para frente y reverso). **El promedio de las cuatro
+  variantes preentrenadas de cada cara (`runs/ensemble`) detecta el 87 % (356 de 410) con 2 % de
+  falsos positivos** (PR-AUC 0,89; ROC-AUC 0,96); con las reglas, 360. La red nunca vista: 93
+  de 100. Comercio con fotos de hasta 700 px: 59 %. Revisión de cámara y fecha limpia (0,98
+  dentro de grupos iguales). Cambiar solo la semilla movió el frente 7 puntos, así que las
+  diferencias entre corridas sueltas no prueban qué variante es mejor; la entrada grande no
+  ayudó; sin transferencia queda en 17 %. `33_combine_sides.py` ahora recibe `--front` y
+  `--back` con una o varias corridas.
+- **Pendiente de decidir por Alejandro:** si el modelo final es el promedio de las cuatro
+  variantes (ocho redes al puntuar) o solo EfficientNet-B0 (dos redes, 86,6 % en una sola
+  corrida). `docs/plan.md` no se ha cambiado por esto.
+- **Siguiente paso:** Alejandro revisa a ojo los 54 positivos que el promedio no detecta
+  (`streamlit run scripts/13_visual_review.py -- --queue runs/ensemble/missed_positives.csv`;
+  un clic por caso, con deshacer). Después: Grad-CAM (mapas de calor) y la fase 5: calibrar el
+  puntaje a 0–100 y el backtest. No hagas búsqueda amplia de hiperparámetros: con 410
+  positivos, probar muchas variantes sobre la misma validación cruzada infla el resultado.
+- **NO existe:** Grad-CAM, calibración a 0–100, backtest, ninguna integración con
+  `mikro_back`.
 
 ## Qué es la solución (resumen; detalle en docs/plan.md §3 y §4)
 
@@ -114,9 +159,13 @@ Dos componentes que alimentan un **indicador de riesgo de falsificación 0–100
    producción ≥ expedición y ≥ 18 años, formato del código, meses de 3 letras, reverso repetido
    entre personas distintas. **Cada regla devuelve PASS / FAIL / NOT_EVALUABLE; solo FAIL suma.**
 2. **Clasificador de imágenes por transferencia de aprendizaje** (MobileNetV3 o EfficientNet
-   preentrenada en ImageNet, afinada), dos instancias de la misma receta: frente y reverso, sobre
-   la cédula recortada y enderezada a 384–512 px. Para lo visual: foto pegada, holograma,
-   calidad de impresión, plantillas repetidas. Grad-CAM para explicar al analista.
+   preentrenada en ImageNet, afinada, en PyTorch), dos instancias de la misma receta: frente y
+   reverso. Es el componente principal. El primer modelo usa la foto completa reducida, sin
+   recorte (el recorte con OpenCV falló en fotos reales). Para lo visual: foto pegada,
+   holograma, calidad de impresión, plantillas repetidas. Grad-CAM para explicar al analista.
+
+Las reglas del punto 1 quedaron como evidencia adicional: solo 49 de 410 positivos fallan alguna,
+porque en las fotos de comercio casi nunca se puede leer el código.
 
 **Un solo tipo de modelo, no varios.** Se descartaron explícitamente (no los vuelvas a proponer
 sin leer el porqué en `docs/context.md`): autoencoder para anomalías, ELA, comparación de la
